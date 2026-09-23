@@ -327,6 +327,7 @@ class QKNormRopeFusionPass(VllmInductorPass):
             ).register(self.pattern_match_passes)
 
         if not HAS_TRITON:
+            logger.debug("QKVNorm and Rope fusion not enabled: triton is unavailable")
             return
         for head_dim, num_heads, num_kv_heads in sorted(
             {(a.head_size, a.num_heads, a.num_kv_heads) for a in attn_layers.values()}
@@ -343,6 +344,12 @@ class QKNormRopeFusionPass(VllmInductorPass):
                     head_dim,
                 )
                 continue
+            logger.debug(
+                "QKVNorm and Rope fusion registered for head_dim %d (num_heads %d, num_kv_heads %d)",
+                head_dim,
+                num_heads,
+                num_kv_heads,
+            )
             for epsilon in [1e-6, 1e-5]:
                 QKVNormRopeFusionPattern(
                     vllm_config=vllm_config,
