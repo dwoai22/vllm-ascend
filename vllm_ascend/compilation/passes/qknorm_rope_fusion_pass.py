@@ -22,10 +22,14 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import Range
 from vllm.logger import logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.compilation.passes.base_pattern import BasePattern
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import get_rope_dim
+
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_rope_vnorm import qkv_rmsnorm_rope_vnorm_fits_ub
 
 
 class QKNormRopeFusionPattern(BasePattern):
@@ -184,6 +188,104 @@ class QKNormRopeFusionPatternWithBias(BasePattern):
         return replacement
 
 
+class QKVNormRopeFusionPattern(BasePattern):
+    def __init__(self, vllm_config, head_dim, num_heads, num_kv_heads, eps=1e-6):
+        super().__init__(vllm_config, eps)
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.device = vllm_config.device_config.device if vllm_config.device_config else None
+        # Both Gemma4 attention types rotate the full head: Gemma4RotaryEmbedding
+        # passes `rotary_dim=head_size` to the base class, so the cos/sin cache
+        # is full width and the model-level `get_rope_dim` is not needed here.
+        self.rope_dim = head_dim
+
+    def pattern_key(self) -> str:
+        # Registered once per attention shape, so the shape has to be part of
+        # the identity or the second registration is silently skipped.
+        return f"{super().pattern_key()}_hd{self.head_dim}_nh{self.num_heads}_nkv{self.num_kv_heads}_rd{self.rope_dim}"
+
+    def get_inputs(self):
+        T = 5
+        max_position_embeddings = 16384
+        qkv = torch.empty(T, self.q_size + 2 * self.kv_size, dtype=torch.bfloat16, device="npu")
+        q_weight = torch.empty(self.head_dim, dtype=torch.bfloat16, device="npu")
+        k_weight = torch.empty(self.head_dim, dtype=torch.bfloat16, device="npu")
+        v_weight = torch.empty(self.head_dim, dtype=torch.bfloat16, device="npu")
+        cos_sin_cache = torch.empty(max_position_embeddings, self.head_dim, dtype=torch.bfloat16, device="npu")
+        positions = torch.ones(T, dtype=torch.int64, device="npu")
+        return [qkv, q_weight, k_weight, v_weight, cos_sin_cache, positions]
+
+    def get_pattern(self):
+        def pattern(
+            qkv: torch.Tensor,
+            q_weight: torch.Tensor,
+            k_weight: torch.Tensor,
+            v_weight: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            positions: torch.Tensor,
+        ):
+            # The structural match treats the split sizes as a wildcard, so a
+            # pattern registered for one attention shape is offered graphs of
+            # every other shape too. The matcher rejects those by re-tracing
+            # this function against the matched tensors, which needs it to
+            # return a different graph rather than raise on the split.
+            if qkv.shape[-1] != self.q_size + 2 * self.kv_size:
+                rejected = torch.zeros_like(qkv)
+                return rejected, rejected, rejected
+
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_norm_out, _ = torch.ops.npu.npu_rms_norm(q_by_head, q_weight, self.eps)
+
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_norm_out, _ = torch.ops.npu.npu_rms_norm(k_by_head, k_weight, self.eps)
+
+            q_flat = q_norm_out.view(q.shape)
+            k_flat = k_norm_out.view(k.shape)
+            q_rope, k_rope = torch.ops.vllm.npu_rotary_embedding(
+                positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.rope_dim, True
+            )
+
+            v_by_head = v.view(*v.shape[:-1], v.shape[-1] // self.head_dim, self.head_dim)
+            v_norm_out, _ = torch.ops.npu.npu_rms_norm(v_by_head, v_weight, self.eps)
+            v_flat = v_norm_out.view(v.shape)
+
+            return q_rope, k_rope, v_flat
+
+        return pattern
+
+    def get_replacement(self):
+        def replacement(
+            qkv: torch.Tensor,
+            q_weight: torch.Tensor,
+            k_weight: torch.Tensor,
+            v_weight: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            positions: torch.Tensor,
+        ):
+            results = DeviceOperator.split_qkv_rmsnorm_rope_vnorm(
+                input=qkv,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                eps=self.eps,
+                q_bias=None,
+                k_bias=None,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+            )
+
+            return results
+
+        return replacement
+
+
 class QKNormRopeFusionPass(VllmInductorPass):
     """
     A pass for fusing QKV split and RMSNorm operations into a single qk_rmsnorm operator.
@@ -223,6 +325,32 @@ class QKNormRopeFusionPass(VllmInductorPass):
                 num_kv_heads=layer.num_kv_heads,
                 eps=epsilon,
             ).register(self.pattern_match_passes)
+
+        if not HAS_TRITON:
+            return
+        for head_dim, num_heads, num_kv_heads in sorted(
+            {(a.head_size, a.num_heads, a.num_kv_heads) for a in attn_layers.values()}
+        ):
+            if not qkv_rmsnorm_rope_vnorm_fits_ub(
+                q_hidden_size=num_heads * head_dim,
+                kv_hidden_size=num_kv_heads * head_dim,
+                head_dim=head_dim,
+                rope_dim=head_dim,
+            ):
+                logger.debug(
+                    "QKVNorm and Rope fusion not enabled for head_dim %d: one token's tiles exceed the "
+                    "vector core unified buffer",
+                    head_dim,
+                )
+                continue
+            for epsilon in [1e-6, 1e-5]:
+                QKVNormRopeFusionPattern(
+                    vllm_config=vllm_config,
+                    head_dim=head_dim,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    eps=epsilon,
+                ).register(self.pattern_match_passes)
 
     def __call__(self, graph: torch.fx.Graph):
         self.begin()
