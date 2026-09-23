@@ -236,23 +236,25 @@ class QKVNormRopeFusionPattern(BasePattern):
                 rejected = torch.zeros_like(qkv)
                 return rejected, rejected, rejected
 
+            # Mirrors the unflatten/flatten idiom in gemma4.py and gemma3n.py,
+            # not the view idiom qwen3.py uses for the base patterns.
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = q.unflatten(-1, (self.num_heads, self.head_dim))
             q_norm_out, _ = torch.ops.npu.npu_rms_norm(q_by_head, q_weight, self.eps)
 
-            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
             k_norm_out, _ = torch.ops.npu.npu_rms_norm(k_by_head, k_weight, self.eps)
 
-            q_flat = q_norm_out.view(q.shape)
-            k_flat = k_norm_out.view(k.shape)
+            q_flat = q_norm_out.flatten(-2, -1)
+            k_flat = k_norm_out.flatten(-2, -1)
             q_rope, k_rope = torch.ops.vllm.npu_rotary_embedding(
                 positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.rope_dim, True
             )
 
-            v_by_head = v.view(*v.shape[:-1], v.shape[-1] // self.head_dim, self.head_dim)
+            v_by_head = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v_norm_out, _ = torch.ops.npu.npu_rms_norm(v_by_head, v_weight, self.eps)
-            v_flat = v_norm_out.view(v.shape)
+            v_flat = v_norm_out.flatten(-2, -1)
 
             return q_rope, k_rope, v_flat
 

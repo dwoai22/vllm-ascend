@@ -76,21 +76,21 @@ class ModelQKVNormRope(nn.Module):
     def forward(self, qkv, cos_sin_cache, positions):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
+        q_by_head = q.unflatten(-1, (self.num_heads, self.head_dim))
         q_norm_out, _ = torch.ops.npu.npu_rms_norm(q_by_head, self.q_weight, self.eps)
 
-        k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
+        k_by_head = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         k_norm_out, _ = torch.ops.npu.npu_rms_norm(k_by_head, self.k_weight, self.eps)
 
-        q_flat = q_norm_out.view(q.shape)
-        k_flat = k_norm_out.view(k.shape)
+        q_flat = q_norm_out.flatten(-2, -1)
+        k_flat = k_norm_out.flatten(-2, -1)
         q_rope, k_rope = torch.ops.vllm.npu_rotary_embedding(
             positions, q_flat, k_flat, cos_sin_cache, self.head_dim, self.head_dim, True
         )
 
-        v_by_head = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+        v_by_head = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
         v_norm_out, _ = torch.ops.npu.npu_rms_norm(v_by_head, self.v_weight, self.eps)
-        v_flat = v_norm_out.view(v.shape)
+        v_flat = v_norm_out.flatten(-2, -1)
 
         return q_rope, k_rope, v_flat
 
