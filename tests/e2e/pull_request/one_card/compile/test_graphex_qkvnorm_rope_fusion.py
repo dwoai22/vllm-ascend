@@ -292,7 +292,10 @@ def test_qkvnorm_rope_fusion_real_modules(dtype, num_tokens, eps, shape, rope_pa
             eps=eps,
         ).register(pm_pass)
 
-        model = ModelGemma4PreAttention(head_dim, num_heads, num_kv_heads, rope_parameters, eps).to("npu")
+        # Build under the device context the way vLLM does. RMSNorm(has_weight=False)
+        # keeps its ones weight as a plain attribute, which .to() would not move.
+        with torch.device("npu"):
+            model = ModelGemma4PreAttention(head_dim, num_heads, num_kv_heads, rope_parameters, eps)
         print(f"rotary_emb is {type(model.rotary_emb).__name__}")
 
         qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
