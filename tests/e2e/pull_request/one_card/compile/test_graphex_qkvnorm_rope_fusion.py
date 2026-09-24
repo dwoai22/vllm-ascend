@@ -292,10 +292,20 @@ def test_qkvnorm_rope_fusion_real_modules(dtype, num_tokens, eps, shape, rope_pa
             eps=eps,
         ).register(pm_pass)
 
-        # Build under the device context the way vLLM does. RMSNorm(has_weight=False)
-        # keeps its ones weight as a plain attribute, which .to() would not move.
-        with torch.device("npu"):
-            model = ModelGemma4PreAttention(head_dim, num_heads, num_kv_heads, rope_parameters, eps)
+        # Build the way vLLM does: under the device context, with the model dtype
+        # as the default. RMSNorm(has_weight=False) keeps its ones weight as a
+        # plain attribute that .to() would not move, and get_rope builds its
+        # cos/sin cache in the default dtype.
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            with torch.device("npu"):
+                model = ModelGemma4PreAttention(head_dim, num_heads, num_kv_heads, rope_parameters, eps)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        assert model.rotary_emb.cos_sin_cache.dtype == dtype, (
+            f"cos_sin_cache is {model.rotary_emb.cos_sin_cache.dtype}, expected {dtype}"
+        )
         print(f"rotary_emb is {type(model.rotary_emb).__name__}")
 
         qkv_size = num_heads * head_dim + 2 * num_kv_heads * head_dim
