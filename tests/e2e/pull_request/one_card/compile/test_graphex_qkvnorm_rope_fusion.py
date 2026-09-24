@@ -102,6 +102,14 @@ class ModelQKVNormRope(nn.Module):
         return q_rope, k_rope, v_flat
 
 
+def graph_op_summary(gm):
+    """Op names in the graph, most frequent first, for diagnosing a missed match."""
+    from collections import Counter
+
+    counts = Counter(str(node.target) for node in gm.graph.nodes if node.op == "call_function")
+    return ", ".join(f"{name} x{n}" for name, n in counts.most_common())
+
+
 def assert_qkvnorm_rope_fusion(after_gm, expect_fused=True):
     check_rules = [
         (torch.ops.vllm.qkv_rmsnorm_rope_vnorm.default, expect_fused),
@@ -111,9 +119,9 @@ def assert_qkvnorm_rope_fusion(after_gm, expect_fused=True):
     for torch_op, expect_exist in check_rules:
         found = find_op(after_gm, torch_op)
         if expect_exist:
-            assert found, f"Expected operator '{torch_op}' but not find"
+            assert found, f"Expected operator '{torch_op}' but not find. Graph holds: {graph_op_summary(after_gm)}"
         else:
-            assert not found, f"Not expected operator '{torch_op}' but find"
+            assert not found, f"Not expected operator '{torch_op}' but find. Graph holds: {graph_op_summary(after_gm)}"
 
 
 def test_pattern_key_is_distinct_per_shape():
