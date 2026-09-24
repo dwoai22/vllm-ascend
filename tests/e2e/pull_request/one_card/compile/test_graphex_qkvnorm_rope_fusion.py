@@ -15,6 +15,7 @@ from vllm.utils.system_utils import update_environment_variables
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.compilation.passes.qknorm_rope_fusion_pass import QKVNormRopeFusionPattern
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.utils import register_ascend_customop
 
 MAX_POSITION_EMBEDDING = 262144
 
@@ -274,6 +275,10 @@ def test_qkvnorm_rope_fusion_real_modules(dtype, num_tokens, eps, shape, rope_pa
         )
         init_distributed_environment()
         ensure_model_parallel_initialized(1, 1)
+        # Swaps RMSNorm/RotaryEmbedding for their Ascend versions. The worker
+        # does this at startup; without it the modules lower to vllm_ir.rms_norm
+        # and an aten rotate_half chain instead of the NPU ops.
+        register_ascend_customop(vllm_config)
 
     with vllm.config.set_current_vllm_config(vllm_config), set_ascend_forward_context(None, vllm_config):
         from torch._inductor.pattern_matcher import PatternMatcherPass
