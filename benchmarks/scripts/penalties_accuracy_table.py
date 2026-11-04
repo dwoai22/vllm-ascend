@@ -34,6 +34,19 @@ against each other. The optimization only changes how tiles are assigned to
 programs, not the arithmetic applied to a tile, so the expected result is a
 **bitwise identical** output: that is what the "before == after" column reports.
 
+Scoring follows the reference accuracy standard's mixed tolerance,
+``|actual_i - golden_i| <= atol + rtol * |golden_i|`` with the per-dtype
+constants in ``TOLERANCES``, and requires both of its criteria at once:
+
+  1. at least ``WITHIN_TOLERANCE_FLOOR`` (99%) of elements satisfy that bound, and
+  2. the maximum absolute error over all elements is within
+     ``max_abs_error_limit(dtype)``.
+
+The second is not implied by the first - in bf16 at ``|golden| = 1000`` the
+elementwise allowance is already ~15.6, far past the limit of 1 - so a case
+only passes when both hold. The process exit status is non-zero if any case
+misses either criterion.
+
 Usage (on an Ascend NPU, from a checkout that has the optimization):
 
     python benchmarks/scripts/penalties_accuracy_table.py
@@ -255,14 +268,43 @@ MIXED_PENALTY_CONFIG = "mixed"
 # Asks for per-request random penalties.
 RANDOM_PENALTY_CONFIG = "random"
 
-# Precision tolerance by data type, following the convention the existing
-# penalties tests use: fp32 is end-to-end fp32 and can be checked tightly,
-# while fp16/bf16 round the stored result.
+# Reference accuracy standard, as (atol, rtol) per output dtype:
+#
+#     |actual_i - golden_i| <= atol + rtol * |golden_i|
+#
+# Written as powers of two so the constants are exactly the ones the standard
+# names. fp32 is the one row where atol and rtol differ.
 TOLERANCES: dict[torch.dtype, tuple[float, float]] = {
-    torch.float32: (1e-5, 1e-5),
-    torch.float16: (1e-3, 1e-3),
-    torch.bfloat16: (1e-2, 1e-2),
+    torch.float16: (2**-9, 2**-9),
+    torch.bfloat16: (2**-6, 2**-6),
+    torch.float32: (2**-16, 2**-10),
 }
+
+# First criterion: at least this fraction of elements must satisfy the
+# elementwise mixed tolerance above.
+WITHIN_TOLERANCE_FLOOR = 0.99
+
+# Second, independent criterion: a ceiling on the largest absolute error
+# anywhere in the tensor. 100% elementwise pass does not imply it - in bf16 at
+# |golden| = 1000 the elementwise allowance is already ~15.6, well past the
+# limit of 1 - so both have to be checked.
+#
+# The standard sets the ceiling to max(fixed_limit, 32 * ULP(1.0)), where
+# ULP(1.0) is the spacing above 1.0 for the dtype, i.e. torch.finfo(dtype).eps
+# (bf16 2**-7, fp16 2**-10, fp32 2**-23). For these three dtypes the fixed limit
+# dominates (32 * eps is 0.25, 0.03125 and 3.8e-6), but the max() is kept so a
+# coarser dtype widens the ceiling as the rule intends.
+FIXED_MAX_ABS_ERROR_LIMITS: dict[torch.dtype, float] = {
+    torch.float16: 0.1,
+    torch.bfloat16: 1.0,
+    torch.float32: 0.01,
+}
+
+
+def max_abs_error_limit(dtype: torch.dtype) -> float:
+    """The standard's maximum absolute error limit for `dtype`."""
+    return max(FIXED_MAX_ABS_ERROR_LIMITS[dtype], 32 * torch.finfo(dtype).eps)
+
 
 DTYPE_NAMES = {
     torch.float32: "fp32",
@@ -573,7 +615,7 @@ def _json_safe(value: float) -> float | None:
 
 @dataclasses.dataclass
 class Deviation:
-    """How far one result sits from another."""
+    """How far one result sits from another, scored against the standard."""
 
     max_abs: float
     max_rel: float
@@ -581,10 +623,33 @@ class Deviation:
     total: int
     tol_ratio: float
     bitwise_equal: bool
+    # None for an exact (atol=rtol=0) comparison, where the standard's two
+    # criteria do not apply and only `bitwise_equal` is meaningful.
+    max_abs_limit: float | None = None
+
+    @property
+    def within_rate(self) -> float:
+        """Fraction of elements satisfying the elementwise mixed tolerance."""
+        if self.total == 0:
+            return 1.0
+        return (self.total - self.num_exceeding) / self.total
+
+    @property
+    def meets_within_rate(self) -> bool:
+        """Criterion 1: the within-tolerance proportion clears the floor."""
+        return self.within_rate >= WITHIN_TOLERANCE_FLOOR
+
+    @property
+    def meets_max_abs(self) -> bool:
+        """Criterion 2: the largest absolute error is within the ceiling."""
+        if self.max_abs_limit is None:
+            return True
+        return self.max_abs <= self.max_abs_limit
 
     @property
     def passed(self) -> bool:
-        return self.num_exceeding == 0
+        """The standard requires both criteria to hold simultaneously."""
+        return self.meets_within_rate and self.meets_max_abs
 
     def to_dict(self) -> dict:
         return {
@@ -592,6 +657,11 @@ class Deviation:
             "max_rel": _json_safe(self.max_rel),
             "num_exceeding": self.num_exceeding,
             "total": self.total,
+            "within_rate": self.within_rate,
+            "within_rate_floor": WITHIN_TOLERANCE_FLOOR,
+            "max_abs_limit": self.max_abs_limit,
+            "meets_within_rate": self.meets_within_rate,
+            "meets_max_abs": self.meets_max_abs,
             "tol_ratio": _json_safe(self.tol_ratio),
             "bitwise_equal": self.bitwise_equal,
             "passed": self.passed,
@@ -604,8 +674,19 @@ class Deviation:
 DEVIATION_CHUNK_ROWS = 64
 
 
-def deviation(actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> Deviation:
-    """Score `actual` against `expected` using the assert_close criterion.
+def deviation(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    max_abs_limit: float | None = None,
+) -> Deviation:
+    """Score `actual` against `expected` against the mixed-tolerance standard.
+
+    ``num_exceeding`` counts the elements violating
+    ``|actual - expected| <= atol + rtol * |expected|``, which drives the
+    within-tolerance proportion; ``max_abs`` is compared against
+    ``max_abs_limit`` separately, since the standard requires both.
 
     With ``atol == rtol == 0`` this degenerates into an exact comparison, and
     ``num_exceeding`` counts every element that differs at all.
@@ -657,6 +738,7 @@ def deviation(actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: f
         total=int(actual.numel()),
         tol_ratio=max_ratio,
         bitwise_equal=bitwise_equal,
+        max_abs_limit=max_abs_limit,
     )
 
 
@@ -682,6 +764,7 @@ class Row:
             "dtype": DTYPE_NAMES[self.dtype],
             "atol": self.atol,
             "rtol": self.rtol,
+            "max_abs_limit": max_abs_error_limit(self.dtype),
             "before_vs_reference": None if self.before is None else self.before.to_dict(),
             "after_vs_reference": self.after.to_dict(),
             "before_vs_after": None if self.before_vs_after is None else self.before_vs_after.to_dict(),
@@ -705,6 +788,7 @@ def run_case(
     apply_penalties_after,
 ) -> Row:
     atol, rtol = TOLERANCES[dtype]
+    abs_limit = max_abs_error_limit(dtype)
     data = create_test_data(
         num_tokens=case.num_tokens,
         vocab_size=case.vocab_size,
@@ -748,8 +832,8 @@ def run_case(
 
     del pristine
 
-    after_dev = deviation(logits, expected, atol, rtol)
-    before_dev = None if before_result is None else deviation(before_result, expected, atol, rtol)
+    after_dev = deviation(logits, expected, atol, rtol, abs_limit)
+    before_dev = None if before_result is None else deviation(before_result, expected, atol, rtol, abs_limit)
     # Compared with atol=rtol=0, so `num_exceeding` counts every element that
     # differs at all: a pure scheduling change should leave this at zero.
     pair_dev = None if before_result is None else deviation(logits, before_result, 0.0, 0.0)
@@ -780,15 +864,35 @@ def _fmt(value: float) -> str:
     return f"{value:.3e}"
 
 
+def _fmt_rate(rate: float) -> str:
+    if rate == 1.0:
+        return "100%"
+    return f"{rate * 100:.4f}%"
+
+
+def _failed(row: Row) -> bool:
+    """Whether any measured result misses the standard."""
+    if not row.after.passed:
+        return True
+    return row.before is not None and not row.before.passed
+
+
 def _verdict(row: Row) -> str:
+    # The standard comes first: two kernels can agree with each other and still
+    # both be wrong, so bitwise equality is only reported once both pass.
+    if _failed(row):
+        which = []
+        if row.before is not None and not row.before.passed:
+            which.append("before")
+        if not row.after.passed:
+            which.append("after")
+        return f"**FAILS STANDARD** ({', '.join(which)})"
     if row.baseline_error is not None:
         return "after only"
     assert row.before_vs_after is not None
     if row.before_vs_after.bitwise_equal:
         return "identical"
-    if row.after.passed and row.before.passed:
-        return "both within tol"
-    return "**MISMATCH**"
+    return "both within standard"
 
 
 def render_markdown(rows: list[Row], env: dict) -> str:
@@ -798,22 +902,22 @@ def render_markdown(rows: list[Row], env: dict) -> str:
     out.append(
         "`before` is the baseline kernel on a `(num_tokens, min(num_vocab_blocks, "
         "65535 // num_tokens))` grid; `after` is the vector-core tiled kernel in this PR. "
-        "Both are scored against the same float32 PyTorch reference, and compared directly "
-        "against each other. The change only reassigns tiles to programs, so the expected "
-        "outcome is a bitwise identical result."
+        "Both are scored against the same float32 PyTorch reference under the reference "
+        "accuracy standard, and compared directly against each other. The change only "
+        "reassigns tiles to programs, so the expected outcome is a bitwise identical result."
     )
     out.append("")
     out.append(
         "| Case | Shape (tokens x vocab) | spec | Penalties | dtype | "
-        "max abs err vs ref (before) | max abs err vs ref (after) | "
-        "elems outside tol (before / after) | before == after | Result |"
+        "max abs err (before) | max abs err (after) | max abs limit | "
+        "within tol (before / after) | before == after | Result |"
     )
-    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in rows:
         case = row.case
         spec = "-" if case.num_speculative_tokens == 0 else str(case.num_speculative_tokens)
         before_abs = "n/a" if row.before is None else _fmt(row.before.max_abs)
-        before_exceed = "n/a" if row.before is None else str(row.before.num_exceeding)
+        before_rate = "n/a" if row.before is None else _fmt_rate(row.before.within_rate)
         if row.before_vs_after is None:
             equal = "n/a"
         else:
@@ -826,19 +930,40 @@ def render_markdown(rows: list[Row], env: dict) -> str:
             f"| {DTYPE_NAMES[row.dtype]} "
             f"| {before_abs} "
             f"| {_fmt(row.after.max_abs)} "
-            f"| {before_exceed} / {row.after.num_exceeding} "
+            f"| {max_abs_error_limit(row.dtype):g} "
+            f"| {before_rate} / {_fmt_rate(row.after.within_rate)} "
             f"| {equal} "
             f"| {_verdict(row)} |"
         )
     out.append("")
 
-    tolerance_note = ", ".join(
-        f"{DTYPE_NAMES[dtype]}: atol=rtol={atol:g}" for dtype, (atol, rtol) in sorted(
-            TOLERANCES.items(), key=lambda kv: DTYPE_NAMES[kv[0]]
+    out.append("Scored against the reference accuracy standard, mixed tolerance")
+    out.append("`|actual - golden| <= atol + rtol * |golden|`, both criteria required:")
+    out.append("")
+    out.append("| Output dtype | rtol | atol | max abs error limit |")
+    out.append("| --- | --- | --- | --- |")
+    for dtype in sorted(TOLERANCES, key=lambda d: DTYPE_NAMES[d]):
+        atol, rtol = TOLERANCES[dtype]
+        out.append(
+            f"| {DTYPE_NAMES[dtype].upper()} "
+            f"| {rtol:g} "
+            f"| {atol:g} "
+            f"| {max_abs_error_limit(dtype):g} |"
         )
+    out.append("")
+    out.append(
+        "1. the proportion of elements meeting the elementwise mixed tolerance is at least "
+        f"{WITHIN_TOLERANCE_FLOOR * 100:g}% (the `within tol` column), and"
     )
-    out.append(f"Tolerance by data type - {tolerance_note}. `elems outside tol` counts elements")
-    out.append("violating `|actual - ref| <= atol + rtol * |ref|`.")
+    out.append(
+        "2. the maximum absolute error over all elements is within the limit above "
+        "(the `max abs err` columns against `max abs limit`)."
+    )
+    out.append("")
+    out.append(
+        "The limit is `max(fixed_limit, 32 * ULP(1.0))`; for these dtypes the fixed limit "
+        "dominates. `before == after` is an exact comparison, independent of the tolerance."
+    )
     out.append("")
 
     unlaunchable = [r for r in rows if r.baseline_error is not None]
@@ -849,12 +974,12 @@ def render_markdown(rows: list[Row], env: dict) -> str:
             out.append(f"- `{row.case.name}` ({DTYPE_NAMES[row.dtype]}): {row.baseline_error}")
         out.append("")
 
-    mismatches = [r for r in rows if _verdict(r) == "**MISMATCH**"]
-    identical = sum(1 for r in rows if _verdict(r) == "identical")
+    failures = [r for r in rows if _failed(r)]
+    identical = sum(1 for r in rows if r.before_vs_after is not None and r.before_vs_after.bitwise_equal)
     out.append(
-        f"**Summary**: {len(rows)} cases, {identical} bitwise identical, "
-        f"{len(mismatches)} mismatched, "
-        f"{sum(1 for r in rows if r.after.passed)}/{len(rows)} within tolerance of the reference."
+        f"**Summary**: {len(rows)} cases, {identical} bitwise identical before vs after, "
+        f"{sum(1 for r in rows if r.after.passed)}/{len(rows)} meeting the standard, "
+        f"{len(failures)} failing it."
     )
     out.append("")
     out.append("<details><summary>Environment</summary>")
@@ -882,10 +1007,13 @@ def render_csv(rows: list[Row]) -> str:
             "dtype",
             "atol",
             "rtol",
+            "max_abs_limit",
             "before_max_abs",
             "after_max_abs",
-            "before_num_exceeding",
-            "after_num_exceeding",
+            "before_within_rate",
+            "after_within_rate",
+            "before_passed",
+            "after_passed",
             "bitwise_equal",
             "verdict",
         ]
@@ -901,10 +1029,13 @@ def render_csv(rows: list[Row]) -> str:
                 DTYPE_NAMES[row.dtype],
                 row.atol,
                 row.rtol,
+                max_abs_error_limit(row.dtype),
                 "" if row.before is None else row.before.max_abs,
                 row.after.max_abs,
-                "" if row.before is None else row.before.num_exceeding,
-                row.after.num_exceeding,
+                "" if row.before is None else row.before.within_rate,
+                row.after.within_rate,
+                "" if row.before is None else row.before.passed,
+                row.after.passed,
                 "" if row.before_vs_after is None else row.before_vs_after.bitwise_equal,
                 _verdict(row),
             ]
@@ -1026,7 +1157,7 @@ def main() -> int:
     else:
         print(text)
 
-    return 1 if any(_verdict(r) == "**MISMATCH**" for r in rows) else 0
+    return 1 if any(_failed(r) for r in rows) else 0
 
 
 if __name__ == "__main__":
