@@ -583,7 +583,11 @@ class KVCacheSendingLayerThread(threading.Thread):
             )
         ):
             raise ValueError("Incompatible component P/D cache layouts")
-        if not req_meta.chunk_finish or not local.is_sender:
+        if not local.is_sender:
+            return [], [], []
+        # Attention rows are immutable once written, so they stream with every
+        # chunk. Circular and recurrent state change until the final chunk.
+        if local.cache_kind != "attention" and not req_meta.chunk_finish:
             return [], [], []
         local_ids = req_meta.local_block_ids[group_idx]
         remote_ids = req_meta.remote_block_ids[remote.tensor_group_idx[0]]
@@ -621,7 +625,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         for meta in (local, remote):
             if meta.dcp_size > 1 and meta.interleave_size % ratio:
                 raise ValueError("DCP interleave must be divisible by the component compression ratio")
-        start = max(0, req_meta.remote_cache_tokens)
+        # local_transed_tokens is the previous chunk's progress rounded down to
+        # a block, so a few complete rows may be resent; rewriting them is safe.
+        start = max(0, req_meta.remote_cache_tokens, req_meta.local_transed_tokens)
         end = req_meta.local_computed_tokens
         for i, payload in enumerate(local.block_len):
             if not payload:
@@ -2200,11 +2206,6 @@ class MooncakeLayerwiseConnectorWorker:
                 raise ValueError("Mamba P/D PCP*TP head shard counts must have an integer ratio")
         result = copy.deepcopy(req_meta)
         result.trans_count = [self.tp_size * self.pcp_size] * self.num_kv_cache_groups
-        # Only the final prefill chunk publishes the full state snapshot. Earlier
-        # chunks may keep updating circular/recurrent state and are not complete.
-        if not req_meta.chunk_finish:
-            result.local_block_ids = [[] for _ in self.kv_cache_specs]
-            result.remote_block_ids = [[] for _ in self.kv_cache_specs]
         result.peers = []
         for rank in range(req_meta.remote_tp_size):
             peer = copy.copy(result)

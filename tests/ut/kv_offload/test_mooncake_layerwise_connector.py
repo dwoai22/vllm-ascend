@@ -208,9 +208,9 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             chunk_finish=False,
         )
 
-    def test_component_compression_skips_prefix_and_preserves_padding(self):
+    def _compressed_attention_request(self):
         # A logical block holds 8 original tokens = two kernel blocks of
-        # two compressed rows each. The last pool (tokens 12..15) is incomplete.
+        # two compressed rows each.
         local = _make_layer_metadata(
             kv_caches_base_addr=[1000],
             block_len=[8],
@@ -238,14 +238,50 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         req.local_block_ids = [[3, 5]]
         req.remote_block_ids = [[99], [7, 9]]
         req.remote_cache_tokens = 4
+        return req, local, remote
+
+    def test_component_compression_skips_prefix_and_preserves_padding(self):
+        # The last pool (tokens 12..15) is incomplete.
+        req, local, remote = self._compressed_attention_request()
         req.local_computed_tokens = 13
         req.chunk_finish = True
         self.assertEqual(
             self.thread._get_component_transfer_meta(req, local, remote, 0),
             ([1000 + 7 * 16, 1000 + 10 * 16], [4000 + 15 * 24, 4000 + 18 * 24], [8, 8]),
         )
-        req.chunk_finish = False
-        self.assertEqual(self.thread._get_component_transfer_meta(req, local, remote, 0), ([], [], []))
+
+    def test_component_attention_streams_complete_rows_per_chunk(self):
+        req, local, remote = self._compressed_attention_request()
+
+        def covered(chunk_finish, transed, computed):
+            req.chunk_finish = chunk_finish
+            req.local_transed_tokens = transed
+            req.local_computed_tokens = computed
+            src, dst, lengths = self.thread._get_component_transfer_meta(req, local, remote, 0)
+            return {(s + k, d + k) for s, d, n in zip(src, dst, lengths) for k in range(n)}
+
+        one_shot = covered(True, 0, 13)
+
+        # The pool of tokens 8..9 is incomplete after the first chunk and is
+        # sent with the second one.
+        req.chunk_finish, req.local_transed_tokens, req.local_computed_tokens = False, 0, 9
+        self.assertEqual(self.thread._get_component_transfer_meta(req, local, remote, 0), ([1112], [4360], [8]))
+        req.chunk_finish, req.local_transed_tokens, req.local_computed_tokens = True, 8, 13
+        self.assertEqual(self.thread._get_component_transfer_meta(req, local, remote, 0), ([1160], [4432], [8]))
+
+        # Scheduler progress is rounded down to a block, so chunks may resend
+        # complete rows but must never skip one or send an incomplete pool.
+        for computed in ([9, 13], [5, 11, 13], [6, 7, 13]):
+            with self.subTest(computed=computed):
+                streamed = set()
+                previous = 0
+                for i, end in enumerate(computed):
+                    final = i == len(computed) - 1
+                    chunk = covered(final, previous // 8 * 8, end)
+                    self.assertLessEqual(chunk, covered(True, 0, end))
+                    streamed |= chunk
+                    previous = end
+                self.assertEqual(streamed, one_shot)
 
     def test_component_tail_copies_fixed_page_despite_prefix_hit(self):
         local = _make_layer_metadata(
@@ -272,6 +308,10 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         req.local_computed_tokens = 149
         req.chunk_finish = True
         self.assertEqual(self.thread._get_component_transfer_meta(req, local, remote, 0), ([1320], [4896], [24]))
+        # State pages keep changing until the final prefill chunk.
+        req.chunk_finish = False
+        self.assertEqual(self.thread._get_component_transfer_meta(req, local, remote, 0), ([], [], []))
+        req.chunk_finish = True
         req.remote_block_ids[1] = []
         with self.assertRaisesRegex(ValueError, "one matching state page"):
             self.thread._get_component_transfer_meta(req, local, remote, 0)
@@ -1577,6 +1617,54 @@ def test_sparse_sfa_c8_save_skips_legacy_quantization_and_preserves_reuse_gate()
     assert task.layer_names == ["layer0"]
     worker._mark_layer_reuse_pending.assert_called_once_with(0)
     assert worker.current_layer == 1
+
+
+def test_component_request_keeps_blocks_before_final_chunk():
+    worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+    worker.tp_size, worker.pcp_size, worker.dcp_size = 1, 2, 1
+    worker.num_kv_cache_groups = 2
+    worker.kv_cache_specs = [MagicMock(), MagicMock()]
+    worker.has_mamba = False
+    req_meta = ReqMeta(
+        local_block_ids=[[1, 2], [3]],
+        token_ids=[],
+        remote_block_ids=[[4, 5], [6]],
+        remote_block_size=[16, 16],
+        remote_engine_id="decoder",
+        remote_host="127.0.0.1",
+        remote_port=7000,
+        remote_te_rpc_port=None,
+        remote_layer_metadata=None,
+        metaserver=None,
+        remote_tp_size=2,
+        remote_pcp_size=1,
+        remote_dcp_size=1,
+        chunk_finish=False,
+    )
+
+    result = worker._prepare_component_request(req_meta)
+
+    assert result.trans_count == [2, 2]
+    assert [peer.remote_port for peer in result.peers] == [7000, 7001]
+    for meta in (result, *result.peers):
+        assert meta.local_block_ids == [[1, 2], [3]]
+        assert meta.remote_block_ids == [[4, 5], [6]]
+
+
+def test_component_save_queues_non_final_chunk():
+    worker, metadata = _make_worker_for_cache_write_event_test()
+    worker.use_component_transfer = True
+    peers = [MagicMock(), MagicMock()]
+    req_meta = metadata.requests["req"]
+    req_meta.chunk_finish = False
+    req_meta.peers = peers
+
+    worker.save_kv_layer("layer0", [MagicMock()], MagicMock(), metadata)
+
+    task = worker.kv_send_layer_thread.send_queue.put.call_args.args[0]
+    assert task.send_request == {"req": req_meta}
+    assert [call.args for call in worker.update_decoder_info.call_args_list] == [("req", peer) for peer in peers]
+    worker._mark_layer_reuse_pending.assert_called_once_with(0)
 
 
 class TestMooncakeLayerwiseStepLifecycle(unittest.TestCase):
