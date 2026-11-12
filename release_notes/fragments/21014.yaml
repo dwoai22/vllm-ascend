@@ -10,6 +10,12 @@ entries:
       the adapter previously refused at startup.
     model: mistral-large-4
     hardware: [Ascend 950]
+  - category: feature
+    text: >-
+      Mistral Large 4 can now be served with prefill/decode disaggregation over
+      MooncakeConnectorV2 (pull). The connector no longer aborts KV cache registration
+      for models in which a layer reads another layer's KV cache.
+    model: mistral-large-4
   - category: bugfix
     text: >-
       Corrected Mistral Large 4 sparse indexer rotary embeddings and aligned DSpark draft attention with its cache writer.
