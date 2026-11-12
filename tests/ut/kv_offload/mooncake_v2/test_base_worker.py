@@ -393,6 +393,9 @@ def test_register_kv_caches_rejects_missing_and_unconfigured_layers() -> None:
     worker.block_size = 16
     worker.side_channel_host = "host"
     worker.handshake_port = 5000
+    # No layer declares KV sharing, so a second name bound to the same tensor
+    # stays an unconfigured layer rather than a borrower.
+    worker.vllm_config = make_sharing_config({})
 
     try:
         worker.register_kv_caches({})
@@ -408,6 +411,109 @@ def test_register_kv_caches_rejects_missing_and_unconfigured_layers() -> None:
         assert "absent from kv_cache_tensors" in str(error)
     else:
         raise AssertionError("unexpected layer must fail")
+
+
+def make_sharing_config(sharing_targets: dict[str, str]) -> SimpleNamespace:
+    """A config whose forward context declares ``layer -> KV source`` pairs."""
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                layer_name: SimpleNamespace(kv_sharing_target_layer_name=target_layer_name)
+                for layer_name, target_layer_name in sharing_targets.items()
+            }
+        ),
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
+    )
+
+
+def make_sharing_worker(monkeypatch, caches: dict[str, torch.Tensor], sharing_targets: dict[str, str]):
+    """A worker configured with ``caches`` as owners and the given borrowers."""
+    spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
+    worker.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
+    worker.pcp_rank, worker.tp_rank, worker.tp_size = 0, 0, 1
+    worker.kv_cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            make_kv_cache_tensor(
+                size=cache.nbytes,
+                layers=[name],
+                layer_stride=cache.nbytes,
+                block_stride=cache.stride(0) * cache.element_size(),
+            )
+            for name, cache in caches.items()
+        ],
+        # The connector is built from the scheduler's view of the groups; the
+        # runner adds KV-sharing layers to a private copy only.
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=list(caches), kv_cache_spec=spec)],
+    )
+    worker.vllm_config = make_sharing_config(sharing_targets)
+    worker.engine_id, worker.te_rpc_port = "engine", 9000
+    worker.block_size, worker.side_channel_host, worker.handshake_port = 16, "host", 5000
+    transfer_engine = MagicMock()
+    monkeypatch.setattr(base_worker, "global_te", transfer_engine)
+    monkeypatch.setattr(base_worker, "validate_register_region_count", MagicMock())
+    return worker, transfer_engine
+
+
+def test_register_kv_caches_publishes_nothing_for_a_kv_sharing_layer(monkeypatch) -> None:
+    """A borrower reaches the connector bound to its source and owns no blocks."""
+    source = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    other = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    caches = {"layers.3.attn": source, "layers.4.attn": other}
+    worker, transfer_engine = make_sharing_worker(monkeypatch, caches, {"layers.7.attn": "layers.3.attn"})
+
+    # What the runner hands over: ``kv_caches[borrower] = kv_caches[source]``.
+    worker.register_kv_caches({**caches, "layers.7.attn": source})
+
+    metadata = worker.xfer_handshake_metadata
+    assert metadata.layer_names == ["layers.3.attn", "layers.4.attn"]
+    assert metadata.kv_caches_base_addr == [[source.data_ptr()], [other.data_ptr()]]
+    # One region per owner: the borrower adds neither a layer nor memory.
+    (ptrs, lengths), _ = transfer_engine.register_buffer.call_args
+    assert len(ptrs) == len(lengths) == 2
+
+
+def test_register_kv_caches_accepts_a_tuple_cache_shared_by_identity(monkeypatch) -> None:
+    """Ascend MLA caches are component tuples; the borrower shares the tuple."""
+    nope = torch.zeros((2, 16, 1, 6), dtype=torch.bfloat16)
+    rope = torch.zeros((2, 16, 1, 2), dtype=torch.bfloat16)
+    worker, _ = make_sharing_worker(monkeypatch, {"layers.3.attn": nope}, {"layers.7.attn": "layers.3.attn"})
+    tensor_config = worker.kv_cache_config.kv_cache_tensors[0]
+    tensor_config.size = nope.nbytes + rope.nbytes
+    source = (nope, rope)
+
+    worker.register_kv_caches({"layers.3.attn": source, "layers.7.attn": source})
+
+    assert worker.xfer_handshake_metadata.layer_names == ["layers.3.attn"]
+    assert worker.xfer_handshake_metadata.kv_caches_base_addr == [[nope.data_ptr(), rope.data_ptr()]]
+
+
+def test_register_kv_caches_rejects_a_kv_sharing_layer_with_its_own_cache(monkeypatch) -> None:
+    """Unconfigured blocks would never be transferred, so the consumer would read garbage."""
+    source = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    own = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    worker, _ = make_sharing_worker(monkeypatch, {"layers.3.attn": source}, {"layers.7.attn": "layers.3.attn"})
+
+    with pytest.raises(ValueError, match=r"'layers.7.attn' is not bound to the cache of 'layers.3.attn'"):
+        worker.register_kv_caches({"layers.3.attn": source, "layers.7.attn": own})
+
+
+def test_register_kv_caches_rejects_a_kv_sharing_layer_whose_source_is_not_transferred(monkeypatch) -> None:
+    source = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    worker, _ = make_sharing_worker(monkeypatch, {"layers.3.attn": source}, {"layers.7.attn": "layers.5.attn"})
+
+    with pytest.raises(ValueError, match=r"'layers.5.attn', which is not a configured KV cache layer"):
+        worker.register_kv_caches({"layers.3.attn": source, "layers.7.attn": source})
+
+
+def test_register_kv_caches_still_rejects_an_undeclared_layer_next_to_a_borrower(monkeypatch) -> None:
+    """Accepting declared borrowers must not open the door to anything else."""
+    source = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+    worker, _ = make_sharing_worker(monkeypatch, {"layers.3.attn": source}, {"layers.7.attn": "layers.3.attn"})
+
+    with pytest.raises(ValueError, match=r"absent from kv_cache_tensors: \['layers.9.attn'\]"):
+        worker.register_kv_caches({"layers.3.attn": source, "layers.7.attn": source, "layers.9.attn": source})
 
 
 def make_worker_config(
