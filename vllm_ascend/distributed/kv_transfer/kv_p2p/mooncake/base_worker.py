@@ -66,6 +66,33 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
+def _get_kv_sharing_targets(vllm_config: VllmConfig) -> dict[str, str]:
+    """Map each KV-sharing layer to the layer whose cache it reads.
+
+    The model declares the relation on its attention layers; the runner turns
+    it into ``kv_caches[layer] = kv_caches[target]``. Reading the declaration
+    rather than inferring sharing from equal tensors keeps an unrelated layer
+    that happens to be handed the same tensor an error.
+    """
+    forward_context = vllm_config.compilation_config.static_forward_context
+    return {
+        layer_name: target_layer_name
+        for layer_name, layer in forward_context.items()
+        if (target_layer_name := getattr(layer, "kv_sharing_target_layer_name", None))
+    }
+
+
+def _is_same_kv_cache(caches: tuple[torch.Tensor, ...], target_caches: tuple[torch.Tensor, ...]) -> bool:
+    """Whether two layers are bound to the same physical cache views."""
+    return len(caches) == len(target_caches) and all(
+        cache.data_ptr() == target_cache.data_ptr()
+        and cache.dtype == target_cache.dtype
+        and cache.shape == target_cache.shape
+        and cache.stride() == target_cache.stride()
+        for cache, target_cache in zip(caches, target_caches)
+    )
+
+
 def _is_component_major_mla_binding(spec: KVCacheSpec, caches: tuple[torch.Tensor, ...]) -> bool:
     """Whether NoPE and RoPE are component-major views of one MLA slot.
 
@@ -499,6 +526,40 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
             raise ValueError("MooncakeConnector single-head NHD requires contiguous bytes within each KV block.")
         return (1, shape[0], shape[2])  # [tokens, 1, dim] has the same bytes as [1, tokens, dim].
 
+    def _validate_kv_sharing_layers(
+        self,
+        kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+        unconfigured_layers: set[str],
+        configured_layer_names: set[str],
+    ) -> set[str]:
+        """Return the unconfigured layers that only borrow a configured cache.
+
+        A KV-sharing layer owns no blocks, so ``kv_cache_tensors`` never lists
+        it, yet the runner binds it to its target's cache and passes that
+        binding here. Such a layer needs no transfer of its own: the target's
+        blocks are the KV it reads. It is accepted only when that holds, since
+        a borrower whose source is not transferred, or which was bound to a
+        cache of its own, would decode from KV the consumer never received.
+        """
+        sharing_targets = _get_kv_sharing_targets(self.vllm_config)
+        sharing_layers = unconfigured_layers & sharing_targets.keys()
+        for layer_name in sorted(sharing_layers):
+            target_layer_name = sharing_targets[layer_name]
+            if target_layer_name not in configured_layer_names:
+                raise ValueError(
+                    f"KV-sharing layer {layer_name!r} reads the cache of {target_layer_name!r}, "
+                    "which is not a configured KV cache layer and would not be transferred."
+                )
+            if not _is_same_kv_cache(
+                as_kv_cache_tensors(kv_caches[layer_name]),
+                as_kv_cache_tensors(kv_caches[target_layer_name]),
+            ):
+                raise ValueError(
+                    f"KV-sharing layer {layer_name!r} is not bound to the cache of {target_layer_name!r}; "
+                    "its own cache has no configured blocks and would not be transferred."
+                )
+        return sharing_layers
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
@@ -607,9 +668,13 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
                     spec.sfa_dcp_replicated_indexer_size if isinstance(spec, AscendSFAIndexerCacheSpec) else 0
                 )
 
-        unexpected_layers = kv_caches.keys() - configured_layer_names
-        if unexpected_layers:
-            raise ValueError(f"KV caches contain layers absent from kv_cache_tensors: {sorted(unexpected_layers)}.")
+        unconfigured_layers = kv_caches.keys() - configured_layer_names
+        if unconfigured_layers:
+            unexpected_layers = unconfigured_layers - self._validate_kv_sharing_layers(
+                kv_caches, unconfigured_layers, configured_layer_names
+            )
+            if unexpected_layers:
+                raise ValueError(f"KV caches contain layers absent from kv_cache_tensors: {sorted(unexpected_layers)}.")
 
         register_regions = collect_configured_register_regions(self.kv_cache_config, kv_caches)
         validate_register_region_count(register_regions)
