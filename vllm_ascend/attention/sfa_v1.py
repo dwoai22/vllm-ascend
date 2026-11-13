@@ -1336,7 +1336,38 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope = ql_nope.transpose(0, 1)
         return ql_nope, q_pe
 
-    def _mistral_q_proj_and_k_up_proj(self, hidden_states: torch.Tensor):
+    def _mistral_log_positions(self, attn_metadata, num_tokens: int) -> torch.Tensor | None:
+        """Derive this step's SSMax ``log(position + 1)`` inside the graph.
+
+        SSMax scales the query by ``s * log(pos + 1) + b``, so it needs one
+        value per query row. Taking that tensor from an attribute the model's
+        eager forward assigns is not graph-safe: the attention math runs inside
+        the ``mla_forward`` custom op, whose signature carries no log positions,
+        so a captured decode graph bakes the address the attribute held at
+        capture time and every replay reads a stale buffer. At capture warmup
+        the attribute still holds the previous (longer) run's tensor, which
+        surfaces as a row-count mismatch in ``SSMaxScaling.forward``.
+
+        The SFA metadata already carries this step's positions as a slice of
+        the model runner's fixed-address positions buffer, so recomputing from
+        it keeps the value inside the captured region: the log kernel re-runs
+        against the buffer the runner refreshes each step, and SSMax reads the
+        freshly computed intermediate rather than a captured-time address.
+        """
+        positions = getattr(attn_metadata, "positions", None)
+        if positions is None:
+            # Paths that build no positions (NoPE metadata, test doubles) fall
+            # back to whatever the model's forward published.
+            return getattr(self, "mistral_log_positions", None)
+        if positions.shape[0] < num_tokens:
+            raise RuntimeError(
+                "Mistral Large 4 SSMax needs one position per query row, but "
+                f"attention metadata carries {positions.shape[0]} for {num_tokens} rows. "
+                f"layer_name={self.layer_name}."
+            )
+        return torch.log(positions[:num_tokens].to(torch.float32) + 1)
+
+    def _mistral_q_proj_and_k_up_proj(self, hidden_states: torch.Tensor, log_positions: torch.Tensor | None = None):
         """Mistral Large 4 query path for the no-q-LoRA SFA contract.
 
         Mistral projects Q directly from hidden states and applies SSMax before
@@ -1344,6 +1375,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         and append the model's zero RoPE lane; RoPE layers project both lanes.
         SSMax is a per-token/per-head scalar, so applying it before absorption
         is numerically identical to scaling the absorbed NoPE lane afterwards.
+
+        ``log_positions`` comes from :meth:`_mistral_log_positions` so it is
+        derived inside the captured region; ``None`` keeps the legacy
+        model-published attribute for eager callers.
         """
         use_rope = bool(getattr(self, "mistral_use_rope", True))
         projected_head_dim = self.qk_head_dim if use_rope else self.qk_nope_head_dim
@@ -1351,7 +1386,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ssmax = getattr(self, "mistral_ssmax", None)
         if ssmax is not None:
-            log_positions = getattr(self, "mistral_log_positions", None)
+            if log_positions is None:
+                log_positions = getattr(self, "mistral_log_positions", None)
             if log_positions is None:
                 raise RuntimeError("Mistral Large 4 SFA query is missing log positions for SSMax.")
             if use_rope:
@@ -1905,6 +1941,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         slot_mapping_sfa = self._get_sfa_kv_slot_mapping(attn_metadata)
         indexer_attn_metadata = self._get_indexer_attn_metadata()
 
+        # Mistral Large 4 is the only SFA model with SSMax. Derive its log
+        # positions here, from graph-stable metadata, and hand them to both
+        # consumers (this query path and the indexer's) so neither depends on
+        # an attribute written outside the captured region. See
+        # _mistral_log_positions for why the published attribute cannot be
+        # read under a full decode graph.
+        mistral_log_positions = None
+        if hasattr(self, "mistral_use_rope"):
+            mistral_log_positions = self._mistral_log_positions(attn_metadata, hidden_states.shape[0])
+            indexer_backend = getattr(self.indexer, "impl", None)
+            if mistral_log_positions is not None and getattr(indexer_backend, "ssmax", None) is not None:
+                indexer_backend.log_positions = mistral_log_positions
+
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = hidden_states.shape[0] if self.qk_rope_head_dim == 0 else attn_metadata.num_input_tokens
         parallel_context = self._get_parallel_forward_context(
@@ -2015,7 +2064,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
 
             if mistral_no_q_lora:
-                ql_nope, q_pe = self._mistral_q_proj_and_k_up_proj(hidden_states)
+                ql_nope, q_pe = self._mistral_q_proj_and_k_up_proj(hidden_states, mistral_log_positions)
                 if self.mistral_use_rope:
                     q_pe = self.rope_single(q_pe, cos, sin)
             else:
