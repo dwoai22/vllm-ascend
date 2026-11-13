@@ -659,6 +659,24 @@ class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4Mixt
 
         self.extract_moe_parameters(vllm_config)
 
+        # Dummy-weight loads never reach load_weights: DummyModelLoader fills
+        # tensors in place rather than calling model.load_weights, so the rope
+        # cache the SFA indexer and MLA metadata builders read through
+        # get_cos_and_sin_mla would stay unpublished and the first
+        # attention-metadata build would dereference None. LeRoPE is applied
+        # only inside _load_weights, which dummy loading also skips, so this
+        # construction-time cache is already the final table here.
+        #
+        # Gated on the load format on purpose: both record helpers are
+        # one-shot, and the derived tables are copies rather than views of
+        # cos_sin_cache, so publishing here unconditionally would pin the
+        # pre-LeRoPE table and silently reduce the real-weight path to it.
+        load_format = getattr(getattr(vllm_config, "load_config", None), "load_format", None)
+        if str(load_format).lower() == "dummy":
+            rotary_emb = self.model.rotary_emb
+            _record_cos_sin_cache(rotary_emb.cos_sin_cache)
+            _record_cos_and_sin_cache_interleaved(rotary_emb, rotary_emb.cos_sin_cache)
+
     def get_model_state_cls(self):
         # Upstream returns MistralLarge4ModelState solely to construct the
         # HIP-only specialized decode after weight loading. Ascend disables
