@@ -23,7 +23,12 @@
    and the cheaper thing to try *first* is `FULL_DECODE_ONLY`, which already works on this model
    and gives prefill npugraph_ex fusion. See [§2.6](#26-the-prefill-node-the-case-that-actually-matters-here).
 
-4. **The one thing I would put on the TODO list now** is the inverse of what was asked: *pin or
+4. **Prefill graphs can be captured at full chunk size.** `max_prefill_cudagraph_capture_tokens`
+   takes any value up to `max_num_batched_tokens`; the low default on Ascend is inherited, not
+   inherent. But **vllm-ascend references none of the MRV2 split capture fields**, so that path is
+   untested here and bypasses Ascend's TP-aligned capture-size filter. See §2.6.
+
+5. **The one thing I would put on the TODO list now** is the inverse of what was asked: *pin or
    document the mode you actually support*, because users launching with default flags currently
    land on an untested path. That's a few lines; see [Recommendation](#recommendation).
 
@@ -250,36 +255,76 @@ of fusion on prefill, with no FX splitting — and it needs **no new work**, bec
 (`test_mistral_large4_decode_replays_under_graph_capture`, which prefills 64 tokens before
 decoding).
 
-**The real reason piecewise underdelivers on prefill is the capture ceiling, not npugraph_ex.**
-Default capture sizing (`vllm/config/vllm.py:2539`):
+**On the capture ceiling — correction (2026-11-19).** An earlier draft of this section said
+piecewise graphs "are never replayed for production-sized prefill chunks". **That was wrong.** It
+described the Ascend *default*, not a limit. The accurate position:
+
+Model runner V2 has a **dedicated prefill capture knob**, separate from the decode one
+(`vllm/config/compilation.py:758`–`770`):
+
+- `prefill_cudagraph_capture_token_sizes` — "Token counts of the CUDA graphs for prefill batches…
+  `[]` captures none, and sizes above `max_num_batched_tokens` are dropped."
+- `max_prefill_cudagraph_capture_tokens` — "Largest token count of a prefill CUDA graph… **at most
+  `max_num_batched_tokens`**. More and wider graphs take memory from the KV cache and lengthen
+  startup."
+
+So **`max_num_batched_tokens` is exactly the documented ceiling** — you can capture a prefill
+piecewise graph for a full chunk. There is even a purpose-built ladder builder,
+`prefill_cudagraph_capture_grid` (`compilation.py:90`), which yields "54 sizes at 8192", so the
+padding worry (capture only 8192, then pad a 200-token tail chunk up to it) does not arise either:
+the dispatcher picks the smallest graph ≥ the token count.
+
+What *is* true is the default. These fields are `None` unless set, and the wide-grid default
+(8192) is gated on `wide_defaults`, which requires SM100 — so on Ascend the `else` branch runs and
+`prefill_sizes = list(shared_sizes)` (`vllm/config/vllm.py:2869`), i.e. the decode-oriented shared
+list, capped by:
 
 ```python
 default_max_graph_size = 1024 if is_data_center_blackwell else 512
 max_graph_size = min(max_num_seqs * decode_query_len * 2, default_max_graph_size)
 ```
 
-With `max_num_seqs=64` and no spec decode that is **128 tokens**; with a 2-token DSpark decode,
-256. `max_num_batched_tokens` is appended to the capture list *only if it fits within*
-`max_cudagraph_capture_size` — and a real prefill chunk of 2k–16k does not. So **piecewise graphs
-are never replayed for production-sized prefill chunks**; you get the compilation/fusion benefit
-and pay per-segment dispatch across the 20+ split points for nothing. That is exactly
-[#22100](https://github.com/vllm-project/vllm-ascend/pull/22100)'s accounting (16k chunk vs a 288
-ceiling → "prefill is never replayed from a captured graph in either mode"), and *that* part of it
-holds regardless of which baseline you start from.
+— **128 tokens** at `max_num_seqs=64` with no spec decode, 256 with a 2-token DSpark decode. That
+is why [#22100](https://github.com/vllm-project/vllm-ascend/pull/22100)'s 16k chunk met a 288
+ceiling and prefill went unreplayed: nobody had raised the knob, not that it could not be raised.
 
-Raising the ceiling to cover your chunk size means capturing piecewise graphs at thousands of
-tokens × model depth, which is the documented Ascend capture-resource-exhaustion failure mode
-(`docs/source/faqs.md` item 17) and for a 1T-A52B model is likely prohibitive on memory.
+> ⚠️ **And here is the Ascend-specific catch, which is the real finding.** `grep` across
+> `vllm_ascend/` and `tests/` returns **zero** references to
+> `prefill_cudagraph_capture_token_sizes`, `max_prefill_cudagraph_capture_tokens` or
+> `decode_cudagraph_capture_request_sizes`. The Ascend platform's capture handling
+> (`platform.py:1371`–`1430`) manipulates only the **deprecated shared**
+> `cudagraph_capture_sizes` / `max_cudagraph_capture_size`: the `reduced_cg_cap` logic, the
+> TP-alignment filter, and `update_cudagraph_capture_sizes`. Consequences:
+>
+> - Setting the prefill knob should work — it is resolved in upstream config — but it is
+>   **completely untested on Ascend**, with no code, test or doc acknowledging it.
+> - Ascend's TP-aligned capture-size filter (required when SP or shared-expert-DP is on, and which
+>   otherwise raises `AssertionError`) operates on the shared list only, so it would **not** apply
+>   to prefill sizes set through the new field. For an SP / shared-expert-DP deployment that is a
+>   plausible hang or assertion gap worth checking before relying on it.
+
+So the cost of capturing prefill graphs at chunk size is **memory and startup**, not impossibility.
+For Mistral Large 4 that cost is steep: piecewise splits at every attention boundary, and the real
+checkpoint's layer indices run to at least 71 (the adapter test notes layers 39..71 all read layer
+35's latent), so a full 54-size grid is on the order of a few thousand captured graph segments.
+Stream *count* is likely fine on a current stack — the release notes put the budget at ~32k graphs
+on A3 and ~64k on Ascend 950 after the HDK 25.5.1 / CANN 8.5.0 fix — so the binding constraint is
+capture memory competing directly with KV cache on a 1T model, plus the documented Ascend
+capture-resource-exhaustion failure mode (`docs/source/faqs.md` item 17).
 
 On top of that, prefill is compute-bound — large GEMMs and big attention — so host launch overhead
 is amortized over far more device work than in decode. That is the structural reason every graph
 mode helps decode more than prefill, and it is visible in
 [#47089](https://github.com/vllm-project/vllm/issues/47089)'s data: gains shrink monotonically as
-batch size grows.
+batch size grows. It is an argument about the *size* of the win, not its existence.
 
-**Net:** yes, piecewise should beat eager on P — but probably by less than you'd hope, and
-`FULL_DECODE_ONLY` is a cheaper candidate that may beat it outright. Settle it by measurement, in
-the order given in [Recommendation](#recommendation).
+**Net:** piecewise on the prefill node is a real option, and with
+`max_prefill_cudagraph_capture_tokens` raised to the chunk size it genuinely does get graph replay
+— the ceiling is a knob, not a wall. The open questions are how much a compute-bound phase gains
+from removing launch overhead, and whether the capture memory is affordable against KV cache on a
+1T model. `FULL_DECODE_ONLY` remains the cheaper first experiment because it needs no new config
+surface and is already validated. Settle it by measurement, in the order given in
+[Recommendation](#recommendation).
 
 ### 2.5 Cost and risk if you do it
 
@@ -334,10 +379,16 @@ The P node runs eager today, so there are two upgrades, and the cheap one is alr
    `[1, 2]`) so the decode graphs it captures and never replays cost almost nothing. This buys
    npugraph_ex fusion on prefill and is **already validated on this model** — no new code, no new
    risk. Measure TTFT.
-2. **P node: eager → `PIECEWISE`**. Measure TTFT against both (1) and eager. This is the one that
-   needs validation work, so only pay for it if it beats (1).
-3. Only if (2) wins: check whether raising `max_cudagraph_capture_size` toward your prefill chunk
-   size is affordable on memory, since without that the piecewise graphs never replay.
+2. **P node: eager → `PIECEWISE`**, and set `max_prefill_cudagraph_capture_tokens` to your
+   `max_num_batched_tokens` so the prefill graphs are actually captured and replayed. Without that
+   the Ascend default caps prefill graphs at ~128–256 tokens and you measure almost nothing (this
+   is the step an earlier draft of this document got wrong). Watch startup time and the KV-cache
+   budget — the graph grid competes with it. Also confirm whether Ascend's TP-aligned capture-size
+   filter needs to apply here if you run SP or shared-expert-DP; it currently only sees the
+   deprecated shared list.
+3. If (2) wins on TTFT but the memory cost is too high, sweep
+   `max_prefill_cudagraph_capture_tokens` down to find the knee — a ceiling covering your common
+   chunk sizes rather than the maximum may capture most of the gain.
 
 Measure **TTFT / prefill latency**, not output tok/s — output tok/s is decode-dominated and will
 hide the entire effect you are looking for. Note that (1) and (2) are independent of the D node;
