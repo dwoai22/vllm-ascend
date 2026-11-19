@@ -10,22 +10,26 @@ not accept the checkpoint's 128x128 block-FP8 scheme::
     AssertionError: Only NO_SCALES and TENSOR (default) are supported for
     qscheme_act
 
-That message comes from the installed vLLM, not from the checkpoint and not
-from vllm-ascend (which does not touch this code path), so the fix is always
-to replace the vLLM install.
+That message comes from the installed vLLM, not from vllm-ascend (which does
+not touch this code path). A vLLM that *does* carry #64534 can still reject a
+checkpoint, with a different message, so pass ``--model`` to have the
+checkpoint's own quantization block checked against the post-PR rules and see
+which of the two is at fault.
 
 This script inspects the vLLM package *files on disk* and imports neither vLLM
 nor torch, so it is fast, safe to run on a head node, and works even when the
 install is broken. Run it with the same interpreter that runs ``vllm serve``:
 
-    python3 check_ml4_support.py
+    python3 check_ml4_support.py --model /path/to/checkpoint
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.metadata
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -80,7 +84,94 @@ def read(path: Path) -> str | None:
         return None
 
 
+def shadowing_copies() -> list[Path]:
+    """Plain ``vllm`` package directories on sys.path, in resolution order.
+
+    An editable install resolves through a finder rather than a path entry, so
+    it does not appear here; a leftover directory copy that shadows it does.
+    """
+    found: list[Path] = []
+    for entry in sys.path:
+        candidate = Path(entry or os.getcwd()) / "vllm" / "__init__.py"
+        if candidate.is_file():
+            found.append(candidate.parent.resolve())
+    return found
+
+
+def check_checkpoint(model_dir: Path) -> bool:
+    """Apply #64534's own quantization rules to this checkpoint's params.json.
+
+    Mirrors _remap_mistral_quantization_args: the same accepted values and the
+    same two assertions, so a rejection here is the one a post-PR vLLM raises.
+    """
+    print(f"\ncheckpoint  : {model_dir}")
+    params_path = model_dir / "params.json"
+    if not params_path.is_file():
+        print("  [FAIL] no params.json (vLLM reads this model through --config-format mistral)")
+        return False
+    try:
+        params = json.loads(params_path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"  [FAIL] cannot parse params.json: {exc}")
+        return False
+
+    ok = True
+    if (model_dir / "config.json").is_file():
+        print("  [FAIL] a config.json sits beside params.json; vLLM merges it in as")
+        print("         defaults, which can drag in a stale layer count. Remove it.")
+        ok = False
+
+    quantization = params.get("quantization")
+    if not quantization:
+        print("  [ok  ] no quantization block (BF16 checkpoint): nothing to validate")
+        return ok
+    if not isinstance(quantization, dict):
+        print(f"  [FAIL] quantization is {type(quantization).__name__}, expected an object")
+        return False
+
+    qformat = quantization.get("qformat_weight")
+    act = quantization.get("qscheme_act")
+    weight = quantization.get("qscheme_weight")
+    print(f"  quantization: qformat_weight={qformat!r} qscheme_act={act!r} qscheme_weight={weight!r}")
+
+    if qformat != "fp8_e4m3":
+        method = str(quantization.get("quant_method", "")).lower().replace("_", "-")
+        if method == "compressed-tensors":
+            print("  [ok  ] compressed-tensors checkpoint: passed through unvalidated here")
+            return ok
+        print(f"  [FAIL] post-PR vLLM raises: Found unknown quantization={quantization!r} in config")
+        return False
+
+    # The two assertions #64534 applies, in order.
+    if act not in ("NO_SCALES", "TENSOR", "BLOCK", None):
+        print("  [FAIL] post-PR vLLM raises: Only NO_SCALES, TENSOR (default) and BLOCK")
+        print(f"         are supported for qscheme_act (yours is {act!r})")
+        print("         This is a checkpoint vLLM cannot read even WITH #64534.")
+        return False
+    if (act == "BLOCK") != (weight == "BLOCK"):
+        print("  [FAIL] post-PR vLLM raises: BLOCK quantization must be used for both")
+        print(f"         weights and activations (act={act!r}, weight={weight!r})")
+        print("         This is a checkpoint vLLM cannot read even WITH #64534.")
+        return False
+
+    if weight == "BLOCK":
+        missing = [k for k in ("block_size_out", "block_size_in") if k not in quantization]
+        if missing:
+            print(f"  [FAIL] BLOCK weights but no {', '.join(missing)}: post-PR vLLM raises KeyError")
+            return False
+        block = [quantization["block_size_out"], quantization["block_size_in"]]
+        print(f"  [ok  ] block-FP8 accepted by #64534 -> weight_block_size {block}, dynamic activations")
+    else:
+        scheme = "dynamic" if act == "NO_SCALES" else "static"
+        print(f"  [ok  ] per-tensor FP8 accepted -> {scheme} activations (pre-PR vLLM accepts this too)")
+    return ok
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Check this environment for Mistral Large 4 support.")
+    parser.add_argument("--model", type=Path, help="checkpoint directory, to validate its params.json too")
+    args = parser.parse_args()
+
     print(f"interpreter : {sys.executable}")
     version, location, editable = dist_info()
     print(f"vllm version: {version}")
@@ -92,6 +183,13 @@ def main() -> int:
         print(f"Install it with #64534:{FIX}")
         return 1
     print(f"package     : {root}")
+    copies = shadowing_copies()
+    if len(copies) > 1 or (copies and copies[0] != root.resolve()):
+        print("\nMore than one vllm package is reachable; the FIRST one wins:")
+        for index, copy in enumerate(copies):
+            print(f"  {index}: {copy}{'   <-- imported' if copy == root.resolve() else ''}")
+        print("A leftover directory copy shadows an editable install. Remove it, or")
+        print("`python3 -m pip uninstall -y vllm` until none remains, then reinstall.")
 
     checks: dict[str, bool] = {}
 
@@ -110,6 +208,13 @@ def main() -> int:
     print()
     for label, ok in checks.items():
         print(f"  [{'ok  ' if ok else 'FAIL'}] {label}")
+
+    checkpoint_ok = check_checkpoint(args.model) if args.model else True
+
+    if all(checks.values()) and not checkpoint_ok:
+        print("\nThis vLLM carries #64534, so the install is fine: the checkpoint above")
+        print("is what vLLM rejects. Fix it, or point --model at the right directory.")
+        return 1
 
     if all(checks.values()):
         print("\nThis vLLM carries #64534: Mistral Large 4 can be served.")

@@ -14,8 +14,11 @@ That PR is not merged, so no vLLM release or nightly has it. Check before
 anything else, with the interpreter that runs `vllm serve`:
 
 ```bash
-python3 check_ml4_support.py
+python3 check_ml4_support.py --model /path/to/checkpoint
 ```
+
+It separates the two causes: a vLLM without #64534, and a checkpoint whose
+quantization block vLLM rejects even with it.
 
 Without it, serving fails while parsing `params.json`:
 
@@ -64,7 +67,8 @@ If you do not need disaggregation, all four nodes in one colocated engine
 
 ## Files
 
-- `check_ml4_support.py` — whether the installed vLLM carries #64534.
+- `check_ml4_support.py` — whether this vLLM carries #64534, and whether the
+  checkpoint's quantization block is one it accepts.
 - `shrink_ml4_config.py` — writes the reduced model directory (2-node preset).
 - `env.sh` — shared settings and helpers; sources `$ML4_PRESET` first.
 - `run_prefill.sh` / `run_decode.sh` — one engine role; take the node index.
