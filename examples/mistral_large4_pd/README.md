@@ -10,8 +10,26 @@ Scripts for bringing up Mistral Large 4 as a 1P1D deployment with
 
 Model support comes from [vllm-ascend#21014](https://github.com/vllm-project/vllm-ascend/pull/21014),
 which needs a vLLM carrying [vllm#64534](https://github.com/vllm-project/vllm/pull/64534).
-Without that vLLM the architecture is not registered and `vllm serve` fails to
-resolve the model.
+That PR is not merged, so no vLLM release or nightly has it. Check before
+anything else, with the interpreter that runs `vllm serve`:
+
+```bash
+python3 check_ml4_support.py
+```
+
+Without it, serving fails while parsing `params.json`:
+
+```
+AssertionError: Only NO_SCALES and TENSOR (default) are supported for qscheme_act
+```
+
+The checkpoint is 128x128 block FP8, so its `params.json` declares
+`qscheme_act: BLOCK`; #64534 is what teaches the Mistral config adapter that
+scheme. The message comes from the installed vLLM — not from the checkpoint,
+and not from vllm-ascend, which does not touch that code path. Patching the
+assertion gets nowhere, because the model package is missing too and
+vllm-ascend registers its adapter only when that package exists. Run the check
+on **every** node: a P/D pair with one side missing #64534 will not work.
 
 ## Why four nodes for the full model
 
@@ -46,6 +64,7 @@ If you do not need disaggregation, all four nodes in one colocated engine
 
 ## Files
 
+- `check_ml4_support.py` — whether the installed vLLM carries #64534.
 - `shrink_ml4_config.py` — writes the reduced model directory (2-node preset).
 - `env.sh` — shared settings and helpers; sources `$ML4_PRESET` first.
 - `run_prefill.sh` / `run_decode.sh` — one engine role; take the node index.
