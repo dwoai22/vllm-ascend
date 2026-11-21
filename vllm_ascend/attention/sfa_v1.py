@@ -1467,6 +1467,73 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope = ql_nope.transpose(0, 1)
         return ql_nope, q_pe
 
+    def _mistral_log_positions(self, attn_metadata, num_rows: int) -> torch.Tensor:
+        """This step's SSMax ``log(position + 1)``, one value per query row.
+
+        SSMax scales the query by ``s * log(pos + 1) + b``, so it needs exactly
+        one value per row of ``q``. The model's forward publishes such a tensor
+        on this impl, but sized for the rows *it* was called with, and that is
+        not always this layer's row count:
+
+        * The model receives the batch with graph padding, while
+          :meth:`_forward_impl` trims ``hidden_states`` to the rows attention
+          metadata describes (``num_input_tokens``). Under a FULL decode graph
+          those counts agree and the published tensor happens to fit. Under
+          PIECEWISE the model input is padded up to a captured token count
+          while metadata keeps the real one, so the published tensor is longer
+          than ``q`` and the scale broadcast fails::
+
+              RuntimeError: The size of tensor a (23) must match the size of
+              tensor b (256) at non-singleton dimension 0
+
+        * The attention math runs inside the ``mla_forward`` custom op, whose
+          signature carries no log positions. Reading an attribute the model
+          rebinds outside that op bakes the address it held at capture time, so
+          every replay of a full graph scales by the previous invocation's
+          tensor -- loudly while row counts differ, silently once they match.
+
+        ``attn_metadata.positions`` avoids both. It is this step's slice of the
+        runner's fixed-address positions buffer, built with the same
+        ``num_input_tokens`` that trims ``hidden_states`` (see ``_build``), so
+        recomputing from it is correctly sized by construction and stays inside
+        the captured region.
+
+        Metadata that carries no positions (NoPE builders, test doubles) falls
+        back to the published attribute, aligned the same way.
+        """
+        positions = getattr(attn_metadata, "positions", None) if attn_metadata is not None else None
+        if positions is None:
+            published = getattr(self, "mistral_log_positions", None)
+            if published is None:
+                raise RuntimeError("Mistral Large 4 SFA query is missing log positions for SSMax.")
+            return self._align_mistral_log_positions(published, num_rows)
+        if positions.shape[0] < num_rows:
+            raise RuntimeError(
+                "Mistral Large 4 SSMax needs one position per query row, but attention "
+                f"metadata carries {positions.shape[0]} for {num_rows} rows. "
+                f"layer_name={self.layer_name}."
+            )
+        return torch.log(positions[:num_rows].to(torch.float32) + 1)
+
+    def _align_mistral_log_positions(self, log_positions: torch.Tensor, num_rows: int) -> torch.Tensor:
+        """Trim SSMax log positions to ``num_rows``, rejecting a short tensor.
+
+        Graph and DP padding are appended after the real rows, so the rows in
+        use are a prefix and trimming is the correct reading of a wider tensor.
+        Fewer rows than ``q`` cannot be repaired by slicing -- it means the
+        publisher and this layer disagree about the batch -- so it is rejected
+        rather than broadcast into silently wrong scaling.
+        """
+        published = log_positions.shape[0]
+        if published == num_rows:
+            return log_positions
+        if published < num_rows:
+            raise RuntimeError(
+                "Mistral Large 4 SSMax needs one log position per query row, but it "
+                f"holds {published} for {num_rows} rows. layer_name={self.layer_name}."
+            )
+        return log_positions[:num_rows]
+
     def _mistral_q_proj_and_k_up_proj(
         self,
         hidden_states: torch.Tensor,
@@ -1474,6 +1541,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor | None = None,
         *,
         try_fused: bool = False,
+        log_positions: torch.Tensor | None = None,
     ):
         """Mistral Large 4 query path for the no-q-LoRA SFA contract.
 
@@ -1482,6 +1550,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         and append the model's zero RoPE lane; RoPE layers project both lanes.
         SSMax is a per-token/per-head scalar, so applying it before absorption
         is numerically identical to scaling the absorbed NoPE lane afterwards.
+
+        ``log_positions`` comes from :meth:`_mistral_log_positions`, so it
+        matches ``q``'s rows and was derived inside the captured region.
+        ``None`` falls back to the attribute the model's forward publishes,
+        aligned to ``q``, which keeps eager callers and tests working.
         """
         use_rope = bool(getattr(self, "mistral_use_rope", True))
         projected_head_dim = self.qk_head_dim if use_rope else self.qk_nope_head_dim
@@ -1490,9 +1563,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         ssmax = getattr(self, "mistral_ssmax", None)
         fused = None
         if ssmax is not None:
-            log_positions = getattr(self, "mistral_log_positions", None)
+            if log_positions is None:
+                log_positions = getattr(self, "mistral_log_positions", None)
             if log_positions is None:
                 raise RuntimeError("Mistral Large 4 SFA query is missing log positions for SSMax.")
+            log_positions = self._align_mistral_log_positions(log_positions, q.shape[0])
             if try_fused and use_rope and self.qk_nope_head_dim == self.qk_rope_head_dim == 64:
                 from vllm_ascend.ops.triton.mistral_mla_q import try_ssmax_split_rope
 
@@ -2147,6 +2222,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         if gate_hidden_states is not None:
             gate_hidden_states = gate_hidden_states[:num_input_tokens]
 
+        # Mistral Large 4's SSMax needs one log(position + 1) per query row.
+        # Derive it here, now that hidden_states holds the rows this layer
+        # actually runs, and hand it to both SSMax users: this query path and
+        # the indexer's, whose Ascend signature carries no log positions. The
+        # attribute the model's forward publishes serves neither on its own --
+        # it is sized for the model's graph-padded input, and it is rebound
+        # outside this custom op, so a captured graph replays a stale address.
+        mistral_log_positions = None
+        if hasattr(self, "mistral_use_rope"):
+            indexer_backend = getattr(self.indexer, "impl", None) if self.runtime_has_indexer else None
+            indexer_needs_ssmax = indexer_backend is not None and getattr(indexer_backend, "ssmax", None) is not None
+            if getattr(self, "mistral_ssmax", None) is not None or indexer_needs_ssmax:
+                mistral_log_positions = self._mistral_log_positions(attn_metadata, hidden_states.shape[0])
+                if indexer_needs_ssmax:
+                    indexer_backend.log_positions = mistral_log_positions
+
         if fused_type == PreprocessType.NATIVE and gate_hidden_states is not None:
             gate_hidden_states = hidden_states
 
@@ -2255,6 +2346,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         and attn_metadata.num_prefills == 0
                         and attn_metadata.num_decode_tokens > 0
                     ),
+                    log_positions=mistral_log_positions,
                 )
             else:
                 ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)

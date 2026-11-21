@@ -425,7 +425,22 @@ class AscendMistralIndexerBackend(AscendSFAIndexerBackend):
                 "the indexer runs. It was not set, so the query would go "
                 "unscaled and long-context attention would flatten."
             )
-        return self.ssmax(q, self.log_positions)
+        # SSMax needs one value per query row. The Ascend SFA impl derives
+        # these for the rows metadata describes and sets them here, so they
+        # already match. A wider tensor means the model's forward published
+        # its own graph-padded input straight to this backend (eager and test
+        # paths): padding is the tail, so the rows in use are a prefix. Fewer
+        # rows than the query cannot be fixed by slicing, so it is rejected
+        # rather than broadcast into silently wrong scaling.
+        log_positions = self.log_positions
+        if log_positions.shape[0] < q.shape[0]:
+            raise RuntimeError(
+                "Mistral Large 4 indexer SSMax needs one log position per query row, "
+                f"but it holds {log_positions.shape[0]} for {q.shape[0]} rows."
+            )
+        if log_positions.shape[0] != q.shape[0]:
+            log_positions = log_positions[: q.shape[0]]
+        return self.ssmax(q, log_positions)
 
     def project_query(
         self,
