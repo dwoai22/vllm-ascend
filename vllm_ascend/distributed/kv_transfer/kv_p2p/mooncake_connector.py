@@ -2579,28 +2579,6 @@ class MooncakeConnectorWorker:
 
         return self._merge_overlapping_register_regions(ptrs, lengths)
 
-    def _get_registered_kv_tensor_buffers_hybrid(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> tuple[list[int], list[int]]:
-        ptrs: list[int] = []
-        lengths: list[int] = []
-
-        for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
-            shared_addrs: list[int] = []
-            for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
-                for single_kv_cache in self._as_kv_cache_tuple(kv_caches[layer_name]):
-                    shared_addrs.append(single_kv_cache.data_ptr())
-
-            if not shared_addrs:
-                continue
-            base_addr = min(shared_addrs)
-            if base_addr % KV_CACHE_BUFFER_ALIGNMENT != 0:
-                raise RuntimeError(f"Tensor start addr {base_addr} is not aligned to 2 MiB.")
-            ptrs.append(base_addr)
-            lengths.append(kv_cache_tensor.size)
-
-        return ptrs, lengths
-
     def _get_registered_layer_buffers(self, kv_caches: dict[str, torch.Tensor]) -> tuple[list[int], list[int]]:
         ptrs: list[int] = []
         lengths: list[int] = []
@@ -2662,11 +2640,18 @@ class MooncakeConnectorWorker:
                 self.block_size_scale[layer_idx].append(block_size_scale)
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
-        if has_mamba_group:
+        if has_mamba_group or self.use_hybrid:
+            # Registration must follow physical allocation ownership, not the
+            # logical KVCacheTensor extent (issue #16632). A hybrid descriptor
+            # only spans one contiguous backing when the shared-pool allocator
+            # runs. With KV transfer enabled it does not: Gemma 4's full and
+            # sliding groups fall back to one private 2 MiB-aligned K/V
+            # allocation per layer, so a descriptor's layers are neither
+            # contiguous nor reachable from the lowest layer pointer. Deriving
+            # a range from min(layer addrs) + descriptor.size then leaves the
+            # tail allocations unregistered, which fails the peer's
+            # BatchValidateMemoryAccess once high block ids are in use.
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
-            register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
-        elif self.use_hybrid:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
             # For normal attention / sparse-c8 KV cache, keep metadata at the
