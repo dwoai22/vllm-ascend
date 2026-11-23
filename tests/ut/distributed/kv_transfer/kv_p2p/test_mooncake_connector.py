@@ -172,6 +172,45 @@ def test_registration_uses_runtime_storage_once_without_descriptors():
     assert regions == ([allocation.data_ptr()], [size])
 
 
+def test_hybrid_registration_covers_private_per_layer_storages():
+    """Hybrid registration must follow physical storage (issue #16632).
+
+    Gemma 4 full/sliding groups overlay one logical pool, so every descriptor
+    carries the whole pool size. With KV transfer enabled the shared-pool
+    allocator bails out and each layer owns a private 2 MiB-aligned K/V
+    allocation, so a range taken from min(layer addr) + descriptor.size
+    registers unowned memory and leaves the tail allocations unregistered.
+    """
+    layer_bytes = 4 * 1024 * 1024
+    layer_names = [f"layer_{index}" for index in range(4)]
+    kv_caches = {
+        name: (
+            make_exact_aligned_cpu_buffer(layer_bytes),
+            make_exact_aligned_cpu_buffer(layer_bytes),
+        )
+        for name in layer_names
+    }
+    # Overlaid groups: the descriptor spans every layer slot in the pool.
+    pool_size = 2 * len(layer_names) * layer_bytes
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.kv_cache_config = types.SimpleNamespace(
+        kv_cache_tensors=[make_mock_kv_cache_tensor(pool_size, layer_names)]
+    )
+
+    ptrs, lengths = worker._get_registered_kv_tensor_buffers(kv_caches)
+
+    # Exactly the eight owned allocations, no descriptor-sized overreach.
+    assert sorted(zip(ptrs, lengths)) == sorted(
+        (tensor.data_ptr(), layer_bytes) for pair in kv_caches.values() for tensor in pair
+    )
+    # Every address the transfer metadata advertises stays inside a region,
+    # including the last block of the last layer.
+    for pair in kv_caches.values():
+        for tensor in pair:
+            end = tensor.data_ptr() + layer_bytes
+            assert any(ptr <= tensor.data_ptr() and end <= ptr + length for ptr, length in zip(ptrs, lengths))
+
+
 @pytest.mark.parametrize("pp_rank,pcp_rank,tp_rank,port", [(0, 0, 0, 5555), (0, 1, 1, 5560), (1, 0, 1, 5564)])
 def test_sender_endpoint_includes_pipeline_and_prefill_context_ranks(pp_rank, pcp_rank, tp_rank, port):
     """HIST-002 boundary: rank-local endpoint and readiness before receiving."""
