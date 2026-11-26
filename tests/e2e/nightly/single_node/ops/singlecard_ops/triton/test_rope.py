@@ -61,6 +61,22 @@ SISO_CASES = [
     if neox_for_bf16 is None or is_neox == (neox_for_bf16 == (dtype == torch.bfloat16))
 ]
 
+# Cover both layouts and dtypes for the single-head DSA indexer K shape.
+SISO_SINGLE_HEAD_CASES = [
+    pytest.param(*shape, dtype, is_neox, id=f"{name}-{dtype}-neox={is_neox}")
+    for shape, name in (
+        ((1, 1, 128, 64), "single-head-one-token"),
+        ((32, 1, 128, 64), "single-head-small-batch"),
+        ((129, 1, 128, 64), "single-head-non-divisible-batch"),
+        ((8192, 1, 128, 64), "single-head-large-batch"),
+        ((1024, 1, 128, 96), "single-head-non-pow2-rotary-dim"),
+        ((1024, 1, 128, 128), "single-head-full-rope"),
+    )
+    for dtype in DTYPES
+    for is_neox in IS_NEOX_STYLE
+]
+
+
 SEEDS = [0]
 DEVICES = [f"npu:{0}"]
 DEFAULT_ATOL = 1e-3
@@ -344,7 +360,10 @@ def test_rotary_embedding_triton_kernel_fp8(
     get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
     reason="Requires Ascend A2/A3/A5",
 )
-@pytest.mark.parametrize("num_tokens,num_q_heads,head_size,rotary_dim,dtype,is_neox_style", SISO_CASES)
+@pytest.mark.parametrize(
+    "num_tokens,num_q_heads,head_size,rotary_dim,dtype,is_neox_style",
+    SISO_CASES + SISO_SINGLE_HEAD_CASES,
+)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
