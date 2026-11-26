@@ -47,7 +47,7 @@ vLLM-Ascend already ships. Backend selection needs no patch: a config with
 ``index_topk`` and no ``compress_ratios`` resolves to ``AscendSFABackend``.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -75,13 +75,6 @@ from vllm.models.mistral.amd.mlp import MistralMLP
 from vllm.models.mistral.amd.moe import MistralMoE
 from vllm.models.mistral.amd.ssmax import SSMaxScaling
 from vllm.models.mistral.common.layer_spec import MistralLayerSpec
-from vllm.models.mistral.mistral_large4.amd.dspark import (
-    MistralLarge4DSparkForCausalLM,
-)
-from vllm.models.mistral.mistral_large4.amd.model import (
-    MistralLarge4ForCausalLM,
-    MistralLarge4Model,
-)
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
 
@@ -89,11 +82,17 @@ from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter, sp_shard
+from vllm_ascend.models.mistral_large4_upstream import (
+    MistralLarge4DSparkForCausalLM,
+    MistralLarge4ForCausalLM,
+    MistralLarge4Model,
+)
 from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
 from vllm_ascend.ops.rotary_embedding import (
     gather_mla_rope,
     refresh_cos_and_sin_cache_interleaved,
 )
+from vllm_ascend.quantization.configs.modelslim_config import AscendModelSlimConfig
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 __all__ = [
@@ -113,6 +112,9 @@ __all__ = [
 
 
 _SHARED_KV_SKIP_MARKER = "_ascend_shared_kv_skip"
+_MXFP8_BLOCK_SIZE = 32
+_E8M0_EXPONENT_BIAS = 127
+_DENSE_KV_PROJECTIONS = (".attention.wkv_a_with_mqa", ".attention.wkv_b")
 
 
 def _produces_topk_for_shared_layers(config: Any, spec: Any) -> bool:
@@ -863,6 +865,48 @@ class MistralLarge4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _restore_mxfp8_kv_projections(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Restore MXFP8 KV projections for the dense MLA prolog and absorption."""
+    pending: dict[str, tuple[str, torch.Tensor]] = {}
+    for name, tensor in weights:
+        projection, _, field = name.rpartition(".")
+        is_mxfp8_weight = field == "weight" and tensor.dtype == torch.float8_e4m3fn
+        if not projection.endswith(_DENSE_KV_PROJECTIONS) or not (is_mxfp8_weight or field == "weight_scale"):
+            yield name, tensor
+            continue
+
+        # Weight and scale may come from different shards or in either order.
+        previous = pending.pop(projection, None)
+        if previous is None:
+            pending[projection] = (field, tensor)
+            continue
+        previous_field, previous_tensor = previous
+        if field == previous_field:
+            raise ValueError(f"Duplicate MXFP8 tensor for {projection}: {field}")
+        weight, scale = (tensor, previous_tensor) if is_mxfp8_weight else (previous_tensor, tensor)
+        if (
+            weight.ndim != 2
+            or weight.shape[1] % _MXFP8_BLOCK_SIZE
+            or scale.shape != (weight.shape[0], weight.shape[1] // _MXFP8_BLOCK_SIZE)
+            or scale.dtype != torch.uint8
+        ):
+            raise ValueError(
+                f"Invalid MXFP8 weight or E8M0 scale for {projection}: "
+                f"weight {tuple(weight.shape)}, scale {tuple(scale.shape)} ({scale.dtype})"
+            )
+
+        # ModelSlim stores the E8M0 exponent bytes in a uint8 tensor.
+        blocks = weight.to(device="cpu", dtype=torch.float32).unflatten(-1, (-1, _MXFP8_BLOCK_SIZE))
+        exponents = scale.to(device="cpu", dtype=torch.int32) - _E8M0_EXPONENT_BIAS
+        restored = torch.ldexp(blocks, exponents.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        yield f"{projection}.weight", restored
+
+    if pending:
+        raise ValueError(f"Incomplete MXFP8 KV projection weight and scale pairs: {sorted(pending)}")
+
+
 @support_torch_compile
 class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4MixtureOfExperts):
     """Mistral Large 4 with the Ascend paths adopted after construction.
@@ -893,6 +937,7 @@ class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4Mixt
             )
 
         self.extract_moe_parameters(vllm_config)
+        self._modelslim_quantized = isinstance(vllm_config.quant_config, AscendModelSlimConfig)
 
     def get_model_state_cls(self):
         # Upstream returns MistralLarge4ModelState solely to construct the
@@ -903,7 +948,9 @@ class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4Mixt
 
         return AscendModelState
 
-    def load_weights(self, weights):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._modelslim_quantized:
+            weights = _restore_mxfp8_kv_projections(weights)
         loaded = super().load_weights(weights)
         # Mistral owns a shared MistralRotaryEmbedding rather than one of the
         # classes replaced by vLLM-Ascend's RoPE registry. Publish its final

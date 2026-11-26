@@ -28,10 +28,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip(
-    "vllm.models.mistral.mistral_large4",
-    reason="upstream vLLM does not ship Mistral Large 4 (vllm-project/vllm#64534)",
-)
+from vllm_ascend.models import _upstream_has_module
+
+if not _upstream_has_module("vllm.models.mistral.mistral_large4"):
+    pytest.skip("upstream vLLM does not ship Mistral Large 4", allow_module_level=True)
 
 from vllm.forward_context import ForwardContext, override_forward_context  # noqa: E402
 
@@ -112,6 +112,50 @@ class _Model(torch.nn.Module):
     def __init__(self, specs):
         super().__init__()
         self.layers = torch.nn.ModuleList(_attn(spec) for spec in specs)
+
+
+@pytest.mark.parametrize("tensor_order", ["weight_first", "scale_first"])
+def test_restore_modelslim_mxfp8_kv_projection_weights(tensor_order):
+    kv_a = "layers.0.attention.wkv_a_with_mqa"
+    kv_b = "layers.0.attention.wkv_b"
+    weight = torch.ones(2, 64).to(torch.float8_e4m3fn)
+    scales = torch.tensor([[127, 128], [126, 129]], dtype=torch.uint8)
+    packed_expert = torch.ones(2, 32, dtype=torch.uint8)
+    float_kv = torch.ones(2, 64, dtype=torch.bfloat16)
+    items = [(f"{kv_a}.weight", weight), (f"{kv_b}.weight", weight)]
+    paired = [(f"{kv_b}.weight_scale", scales), (f"{kv_a}.weight_scale", scales)]
+    if tensor_order == "scale_first":
+        items, paired = paired, items
+    passthrough = [
+        ("layers.1.experts.0.w1.weight", packed_expert),
+        ("layers.1.attention.wkv_b.weight", float_kv),
+    ]
+
+    restored = dict(ml4._restore_mxfp8_kv_projections([*items, *passthrough, *paired]))
+
+    expected = torch.tensor([[1, 2], [0.5, 4]], dtype=torch.bfloat16).repeat_interleave(32, dim=1)
+    for name in (kv_a, kv_b):
+        torch.testing.assert_close(restored[f"{name}.weight"], expected)
+        assert f"{name}.weight_scale" not in restored
+    for name, tensor in passthrough:
+        assert restored[name] is tensor
+
+
+def test_restore_modelslim_mxfp8_kv_projection_requires_both_tensors():
+    weight = torch.zeros(1, 32).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="Incomplete MXFP8 KV projection"):
+        list(ml4._restore_mxfp8_kv_projections([("layers.0.attention.wkv_b.weight", weight)]))
+
+
+def test_restore_modelslim_mxfp8_kv_projection_checks_scale_shape():
+    weight = torch.zeros(1, 64).to(torch.float8_e4m3fn)
+    scale = torch.full((1, 1), 127, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="Invalid MXFP8 weight or E8M0 scale"):
+        list(
+            ml4._restore_mxfp8_kv_projections(
+                [("layers.0.attention.wkv_b.weight", weight), ("layers.0.attention.wkv_b.weight_scale", scale)]
+            )
+        )
 
 
 # --------------------------------------------------------------- KV sharing

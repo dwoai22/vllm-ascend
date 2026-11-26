@@ -336,6 +336,31 @@ export LD_LIBRARY_PATH=/usr/local/lib64/python3.12/site-packages/mooncake:$LD_LI
 
 We can run the following scripts to launch a server on the prefiller/decoder node, respectively. Please note that each P/D node will occupy ports ranging from kv_port to kv_port + num_chips to initialize socket listeners. To avoid any issues, port conflicts should be prevented.
 
+### Mistral Large 4 W4A4C8
+
+For a ModelSlim AscendV1 W4A4C8 checkpoint, use one eight-device Ascend 950DT node per engine.
+Run the same vLLM and vLLM Ascend revisions and the same checkpoint on both engines.
+The vLLM revision must include [Mistral Large 4 support](https://github.com/vllm-project/vllm/pull/64534).
+
+Use the following model arguments on both nodes. Set `kv_connector` to
+`MooncakeConnectorV2`, with `kv_role` set to `kv_producer` on prefill and
+`kv_consumer` on decode. Set `dp_size: 1` and `tp_size: 8` for both roles in
+`kv_connector_extra_config` and enable `use_ascend_direct`.
+
+```bash
+--config-format mistral --tokenizer-mode mistral \
+--load-format safetensors --quantization ascend \
+--hf-overrides '{"quantization_config": null, "text_config": {"quantization_config": null}}' \
+--tensor-parallel-size 8 --enable-expert-parallel --language-model-only \
+--kv-cache-dtype fp8_ds_mla --no-enable-prefix-caching --enforce-eager
+```
+
+Use Model Runner V2 on both engines. Keep prefill and decode context parallelism and
+KV parallelism at size 1 for initial validation. The Mistral config format retains
+the layer layout from `params.json`. The override clears the original checkpoint's
+FP8 metadata so `--quantization ascend` uses the per-layer ModelSlim description.
+The `safetensors` load format selects the ModelSlim weight shards.
+
 ### MooncakeConnectorV2 KV Leases
 
 `MooncakeConnectorV2` retains producer KV
