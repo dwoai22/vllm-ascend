@@ -715,14 +715,22 @@ def _triton_rope_siso_token_blocked(
     )
 
 
-def _siso_token_block_size(num_tokens: int, num_vectorcore: int, cap: int = 128) -> int:
-    """Spread tokens over every core first; widen the tile only once each core has work.
+def _siso_token_block_size(num_tokens: int, num_vectorcore: int, floor: int = 16, cap: int = 128) -> int:
+    """Rows per program for the token-blocked kernel.
 
-    A fixed block size would starve small batches: at 32 tokens a block of 128 leaves one
-    program running what the per-head kernel spreads over 32.
+    Both bounds are measured, not derived, and were taken on one part (64 vector cores,
+    rope_dim 64, bf16); another NPU may want different ones.
+
+    The floor is the important one. Spreading one row per program is catastrophic rather
+    than merely suboptimal: at 8192 tokens on the interleaved layout, BLOCK_M 1 and 2
+    cost 864 us and 24.5 us against 4.25 us at 128. Per-program cost dominates long
+    before parallelism does, and small batches are where a core-count-derived block size
+    lands in that region.
+
+    The cap matters much less: 256 was within 10% of 128 at 8192 tokens.
     """
     per_core = triton.cdiv(num_tokens, num_vectorcore)
-    return max(1, min(cap, triton.next_power_of_2(per_core)))
+    return max(floor, min(cap, triton.next_power_of_2(per_core)))
 
 
 def rope_forward_triton_siso(
