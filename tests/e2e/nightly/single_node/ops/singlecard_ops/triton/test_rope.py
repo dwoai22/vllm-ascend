@@ -43,6 +43,11 @@ SISO_SINGLE_HEAD_CASES = [
     pytest.param(8192, 1, 128, 64, id="single-head-large-batch"),
     pytest.param(1024, 1, 128, 96, id="single-head-non-pow2-rotary-dim"),
     pytest.param(1024, 1, 128, 128, id="single-head-full-rope"),
+    # Token count drives the block size, and the kernel is specialized per block
+    # size, so cover more than one. 8192 divides evenly into the largest block;
+    # 8191 leaves a mostly-masked tail there, and 2048 compiles a middle one.
+    pytest.param(8191, 1, 128, 64, id="single-head-masked-tail-large-block"),
+    pytest.param(2048, 1, 128, 64, id="single-head-middle-block"),
 ]
 
 SEEDS = [0]
