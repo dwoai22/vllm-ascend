@@ -660,6 +660,62 @@ def rope_forward_triton(
     return q, k
 
 
+@triton.jit
+def _triton_rope_siso_token_blocked(
+    qk_ptr,
+    qk_row_stride,
+    cos_ptr,
+    cos_row_stride,
+    sin_ptr,
+    sin_row_stride,
+    num_tokens,
+    rope_dim: tl.constexpr,
+    pad_half: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """NeoX RoPE over a single-head ``[tokens, 1, head_dim]`` tensor, tiled by token.
+
+    ``_triton_rope_siso`` takes its vector width from ``pad_n_h``, so a single head
+    leaves only a ``pad_rope_dim // 2`` tile - 32 lanes at rope_dim 64 - and the kernel
+    runs load-pipeline bound. Tiling over tokens restores the width.
+
+    cos/sin are loaded as a ``[BLOCK_M, pad_half]`` tile so every row keeps its own
+    angles. Reusing one row's angles across the tile would compute silently wrong
+    output, which is why this cannot be done by reshaping the caller's tensor.
+    """
+    pid = tl.program_id(0)
+    half: tl.constexpr = rope_dim // 2
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, pad_half)
+    mask = (rows < num_tokens)[:, None] & (cols < half)[None, :]
+
+    cos_tile = tl.load(cos_ptr + rows[:, None] * cos_row_stride + cols[None, :], mask=mask, other=0).to(tl.float32)
+    sin_tile = tl.load(sin_ptr + rows[:, None] * sin_row_stride + cols[None, :], mask=mask, other=0).to(tl.float32)
+
+    first_half_offsets = rows[:, None] * qk_row_stride + cols[None, :]
+    qk_tile_1 = tl.load(qk_ptr + first_half_offsets, mask=mask, other=0).to(tl.float32)
+    qk_tile_2 = tl.load(qk_ptr + first_half_offsets + half, mask=mask, other=0).to(tl.float32)
+
+    # y = [x1, x2] * [cos, cos] + [-x2, x1] * [sin, sin]
+    out_dtype = qk_ptr.dtype.element_ty
+    tl.store(qk_ptr + first_half_offsets, (qk_tile_1 * cos_tile - qk_tile_2 * sin_tile).to(out_dtype), mask=mask)
+    tl.store(
+        qk_ptr + first_half_offsets + half,
+        (qk_tile_2 * cos_tile + qk_tile_1 * sin_tile).to(out_dtype),
+        mask=mask,
+    )
+
+
+def _siso_token_block_size(num_tokens: int, num_vectorcore: int, cap: int = 128) -> int:
+    """Spread tokens over every core first; widen the tile only once each core has work.
+
+    A fixed block size would starve small batches: at 32 tokens a block of 128 leaves one
+    program running what the per-head kernel spreads over 32.
+    """
+    per_core = triton.cdiv(num_tokens, num_vectorcore)
+    return max(1, min(cap, triton.next_power_of_2(per_core)))
+
+
 def rope_forward_triton_siso(
     qk: torch.Tensor,
     cos: torch.Tensor = None,
@@ -710,6 +766,24 @@ def rope_forward_triton_siso(
             # If rope_dim is not specified, we assume that input cos/sin is not
             # duplicated to rope_dim, which means rope_dim == cos.shape[-1] * 2
             rope_dim = cos.shape[-1] * 2
+        if n_head == 1 and is_neox_style:
+            # The DSA indexer K path passes [tokens, 1, head_dim]; one head collapses
+            # the per-head tile, so tile over tokens instead. Non-NeoX keeps the shared
+            # kernel: this one implements the NeoX layout only.
+            block_m = _siso_token_block_size(num_tokens, num_vectorcore)
+            _triton_rope_siso_token_blocked[(triton.cdiv(num_tokens, block_m),)](
+                qk,
+                qk.stride(0),
+                cos,
+                cos.stride(0),
+                sin,
+                sin.stride(0),
+                num_tokens,
+                rope_dim=rope_dim,
+                pad_half=triton.next_power_of_2(rope_dim // 2),
+                BLOCK_M=block_m,
+            )
+            return qk
         _triton_rope_siso[(n_row,)](
             qk,
             qk.stride(0),

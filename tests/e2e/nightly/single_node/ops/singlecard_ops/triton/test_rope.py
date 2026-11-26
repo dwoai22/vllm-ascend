@@ -33,6 +33,17 @@ SISO_REGRESSION_CASES = [
     pytest.param(16, 64, 128, 128, id="a2-non-neox-ub-guard"),
     pytest.param(16, 64, 256, 128, id="a2-non-neox-large-head-ub-guard"),
 ]
+# Single-head SISO: the DSA indexer K path passes [tokens, 1, head_dim]. Every case
+# above uses 64 heads, so this shape had no coverage. NeoX takes the token-blocked
+# kernel and non-NeoX the per-head one, so both are exercised here.
+SISO_SINGLE_HEAD_CASES = [
+    pytest.param(1, 1, 128, 64, id="single-head-one-token"),
+    pytest.param(32, 1, 128, 64, id="single-head-small-batch"),
+    pytest.param(129, 1, 128, 64, id="single-head-non-divisible-batch"),
+    pytest.param(8192, 1, 128, 64, id="single-head-large-batch"),
+    pytest.param(1024, 1, 128, 96, id="single-head-non-pow2-rotary-dim"),
+    pytest.param(1024, 1, 128, 128, id="single-head-full-rope"),
+]
 
 SEEDS = [0]
 DEVICES = [f"npu:{0}"]
@@ -319,7 +330,10 @@ def test_rotary_embedding_triton_kernel_fp8(
     reason="Requires Ascend A2/A3/A5",
 )
 @pytest.mark.parametrize("is_neox_style", IS_NEOX_STYLE)
-@pytest.mark.parametrize("num_tokens,num_q_heads,head_size,rotary_dim", SISO_CASES + SISO_REGRESSION_CASES)
+@pytest.mark.parametrize(
+    "num_tokens,num_q_heads,head_size,rotary_dim",
+    SISO_CASES + SISO_REGRESSION_CASES + SISO_SINGLE_HEAD_CASES,
+)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
