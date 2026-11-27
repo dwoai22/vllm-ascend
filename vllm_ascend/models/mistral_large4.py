@@ -949,6 +949,9 @@ class AscendMistralLarge4ForCausalLM(MistralLarge4ForCausalLM, MistralLarge4Mixt
         return AscendModelState
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The text-only model can be loaded from a checkpoint that also has vision weights.
+        vision_prefixes = ("vision_encoder.", "patch_merger.", "pre_mm_projector_norm.", "vision_language_adapter.")
+        weights = ((name, tensor) for name, tensor in weights if not name.startswith(vision_prefixes))
         if self._modelslim_quantized:
             weights = _restore_mxfp8_kv_projections(weights)
         loaded = super().load_weights(weights)
