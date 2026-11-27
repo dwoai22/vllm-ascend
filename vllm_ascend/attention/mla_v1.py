@@ -493,14 +493,24 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.slot_mapping = common.slot_mapping[: self.num_actual_tokens]
         prefill = None
         if self.num_prefills:
+            # A graph for the target can pad requests even when FlashMLA is
+            # only used by draft layers. FIA gathers history for real rows.
+            num_real_reqs = self.num_decodes + self.num_prefills
+            prefill_common = common.replace(
+                num_reqs=num_real_reqs,
+                query_start_loc=common.query_start_loc[: num_real_reqs + 1],
+                query_start_loc_cpu=common.query_start_loc_cpu[: num_real_reqs + 1],
+            )
+            self.block_table = self.block_table[:num_real_reqs]
             # FIA's existing history gather needs exact host prefill lengths.
             # Do not discard these mirrors as the reference's all-Flash path does.
-            self.query_lens = (common.query_start_loc_cpu[1:] - common.query_start_loc_cpu[:-1])[: common.num_reqs]
+            prefill_offsets = prefill_common.query_start_loc_cpu
+            self.query_lens = prefill_offsets[1:] - prefill_offsets[:-1]
             self.seq_lens = common._seq_lens_cpu if common._seq_lens_cpu is not None else common.seq_lens_cpu
             if self.seq_lens is None:
                 raise RuntimeError("FIA prefill requires the runner's CPU sequence lengths")
-            self.seq_lens = self.seq_lens[: common.num_reqs]
-            prefill = self.build_prefill_metadata(common_prefix_len, common)
+            self.seq_lens = self.seq_lens[:num_real_reqs]
+            prefill = self.build_prefill_metadata(common_prefix_len, prefill_common)
 
         flash = None
         decode = None
