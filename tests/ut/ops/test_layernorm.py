@@ -282,6 +282,16 @@ def test_norm_bias_lookup_reports_missing_bias(clean_norm_bias_cache):
     assert ascend_layernorm._quant_description_has_norm_bias(quant_description) is False
 
 
+def test_norm_bias_lookup_ignores_indexer_layernorm_bias(clean_norm_bias_cache):
+    indexer_biases = {
+        "layers.0.attention.indexer.k_norm.bias": "FLOAT",
+        "layers.0.attention.indexer.q_input_norm.bias": "FLOAT",
+    }
+    assert ascend_layernorm._quant_description_has_norm_bias(indexer_biases) is False
+    quant_description = {**indexer_biases, "model.layers.0.input_layernorm.bias": "FLOAT"}
+    assert ascend_layernorm._quant_description_has_norm_bias(quant_description) is True
+
+
 def test_norm_bias_lookup_ignores_a_stale_entry(clean_norm_bias_cache):
     """An id can only be reused after the old dict is gone; never trust it blindly."""
     quant_description = {"model.layers.0.input_layernorm.norm.bias": "FLOAT"}
