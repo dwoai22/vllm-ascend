@@ -71,6 +71,8 @@ SISO_SINGLE_HEAD_CASES = [
         ((8192, 1, 128, 64), "single-head-large-batch"),
         ((1024, 1, 128, 96), "single-head-non-pow2-rotary-dim"),
         ((1024, 1, 128, 128), "single-head-full-rope"),
+        ((8191, 1, 128, 64), "single-head-masked-tail-large-block"),
+        ((2048, 1, 128, 64), "single-head-middle-block"),
     )
     for dtype in DTYPES
     for is_neox in IS_NEOX_STYLE
